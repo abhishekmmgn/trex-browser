@@ -73,8 +73,17 @@ pub const COMMANDS: &[Command] = &[
         help: "Lay the page out at a given size instead of the pane's, to test other widths and media queries, or to get a site's desktop layout in a small pane. If it is bigger than the pane it is shown shrunk to fit. Stays until kb ctl viewport reset.",
         params: &[required("size", "WIDTHxHEIGHT in CSS pixels (such as 1280x800), a width alone, or reset")],
     },
-    Command { name: "back", help: "Go back one page in history.", params: &[] },
+    Command {
+        name: "back",
+        help: "Go back one page in history. In a window the page opened (a sign-in popup, a new tab) that has no earlier page, close it instead, showing the page that opened it: the way to dismiss a popup.",
+        params: &[],
+    },
     Command { name: "forward", help: "Go forward one page in history.", params: &[] },
+    Command {
+        name: "quit",
+        help: "Quit this kb and its browser. In a pane that ran only kb, the pane closes; a headless kb (kb --headless) stops. Cookies and sign-ins are kept in its profile.",
+        params: &[],
+    },
     Command {
         name: "screenshot",
         help: "Take a PNG screenshot of what the window shows, of one element, or of the whole page. By default one image pixel is one CSS pixel (a 1280x800 viewport gives 1280x800): sharp enough to read, and a quarter of the size of a retina capture. A whole page taller than 8000 pixels is scaled down to fit.",

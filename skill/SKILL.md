@@ -1,174 +1,214 @@
 ---
 name: kb
-description: Drive kb, a real browser (headless Chrome) drawn in a terminal pane beside you that the user watches, with `kb ctl`. Use it to preview and test web work (a page, component, CSS, local dev server or HTML file: see it, check it for console or network errors, click through it, test a phone layout); to run QA on web flows and write repeatable test scripts; and to look things up and read on the web (search, docs, articles), showing the user the pages you cite. Also use when the user asks you to open, show, preview or check a page.
+description: "A real browser in a terminal pane beside you, driven with `kb ctl`. The user watches each page and click as you work. Prefer it to a browser extension or Playwright when working with someone in the terminal: they see what you do, their sign-ins stay, and sites work as in any browser (Reddit and LinkedIn too). Use it to preview and test web pages and local dev servers, check for errors, try phone layouts, run QA and test scripts, and look things up, showing the pages you cite. Also use it when the user asks to open, show or check a page."
 ---
 <!-- Installed by "kb skill install". Remove it with "kb skill remove". -->
 
 # kb
 
-kb is a browser that runs in a terminal pane. You open it in a pane next to
-yours, the user sees the page there, and you drive the same page with
-`kb ctl`. What you do happens on the page they are watching, so use it to
-show your work as well as to do it.
+kb is a browser in a terminal pane. You open it beside your pane, the user
+watches the page there, and you drive it with `kb ctl`. Use it to show your
+work as well as to do it.
 
-Run `kb ctl --help` for every command, and `kb ctl <command> --help` for one.
+## Why kb
 
-## Open a pane, and know which kb is yours
+- **The user sees it.** They watch you work, can stop you, and can take over
+  with the mouse. Playwright and other headless tools show nothing until you
+  report back.
+- **Sign-ins stay.** kb keeps its own profile (`~/.kittybrowser/profile`),
+  apart from the user's everyday Chrome. They sign in to a site once and stay
+  signed in; sign-in popups ("Continue with Google") work. Only the first kb
+  running uses that profile: one opened beside it gets a fresh profile, so to
+  use their sign-ins, reuse their kb if they say so, or ask them to close it.
+- **Sites work as in any browser,** including ones some extensions don't
+  support, such as Reddit or LinkedIn. kb gets around nothing: a site's terms
+  apply, and you act for the user, at a person's pace.
 
-Several kbs can run at once (the user may have their own, other agents
-theirs), and each gets a number. Always pass yours with `-i`; without it,
-commands go to the lowest-numbered kb, which may be someone else's. Never
-drive a kb you didn't open.
+When nobody needs to watch (a CI job, say), a headless tool is fine.
 
-If one you opened earlier in this conversation is still listed by `kb list`,
-reuse it instead of opening another.
+`kb ctl --help` lists every command; `kb ctl <command> --help` explains one.
 
-In Rex (`$REX_SESSION` is set), split a pane beside yours. `kb list` shows
-each kb's number, page and pane, so find yours by the pane you created:
+## Your kb, in a pane beside yours
+
+Several kbs can run at once, each with a number. Always pass yours with
+`-i N`: without it, commands go to the lowest-numbered kb, which may be
+someone else's. Never drive a kb you didn't open. If one you opened earlier
+in this conversation is still in `kb list`, reuse it.
+
+To open one, start `kb "$url"` in a new pane beside yours and take the number
+`kb list` didn't show before. Run it all as one shell command, since
+`$before` is gone in the next:
 
 ```sh
-pane=$(rex split -s "$REX_SESSION" -b "$REX_BLOCK" --split=right --focus=false --label kb --json -- kb "$url" | jq -r '.block_ids[0]')
+before=$(kb list 2>/dev/null | cut -f1)
+# ... start `kb "$url"` in a new pane beside yours (see below) ...
 for _ in $(seq 1 40); do
-  n=$(kb list 2>/dev/null | awk -F'\t' -v p="$pane" '$3 == p {print $1}')
+  n=$(kb list 2>/dev/null | cut -f1 | grep -vxF "$before" | head -n1)
   [ -n "$n" ] && break
   sleep 0.25
 done
-echo "kb $n in $pane"
-k() { kb ctl -i "$n" "$@"; }   # then: k open URL, k check, ...
+echo "kb $n"
 ```
 
-Write down both `n` and `pane`. Numbers are reused: when a kb closes, the
-next one to start may take its number, so if you lose track, find yours again
-by its pane with `kb list`, and if you can't, stop and ask. Close your pane
-when asked with `rex block close -s "$REX_SESSION" "$pane"`; otherwise leave
-it open, as the user may want to keep looking.
+Each shell command starts afresh, so write the number into every command:
+`kb ctl -i 3 open URL`. Below, `N` stands for it, and outside code blocks a
+command is named alone: `box` means `kb ctl -i N box`.
 
-In any other terminal, ask the user to start `kb URL` in a pane of a terminal
-with the kitty graphics protocol (Ghostty, kitty, WezTerm), then find its
-number with `kb list`. If kb won't start there, or its pane stays blank,
-`kb doctor` run in that pane says why.
+Opening a pane without taking the user's focus:
+
+| Terminal | Command |
+|---|---|
+| Rex (`$REX_SESSION` set) | `rex split -s "$REX_SESSION" -b "$REX_BLOCK" --split=right --focus=false --label kb --json -- kb "$url"` |
+| herdr (`HERDR_ENV=1`) | `herdr pane split <your pane> --direction right --no-focus`, then `herdr pane run <new pane> "kb $url"` |
+| kitty | `kitten @ launch --location=vsplit --keep-focus kb "$url"` (needs remote control) |
+| WezTerm | `wezterm cli split-pane --right -- kb "$url"` |
+| Ghostty, cmux, others | the terminal's own command or scripting, if any; or ask the user to split a pane (Cmd+D in Ghostty) and run `kb URL` |
+| tmux, screen, Zellij | can't show kb's images: open it in a pane of the terminal itself |
+
+In Rex, `kb list` and `status` show each kb's pane (`block:…`); close yours
+with `rex block close block:…`. Elsewhere, use the terminal's own command.
+Closing the pane quits that kb. Leave it open unless asked to close it: the
+user may want to keep looking.
+
+Numbers are reused once a kb closes. If you lose track, find yours in
+`kb list` by its pane or page; if you can't, stop and ask. If kb won't start,
+or its pane stays blank, `kb doctor` run in that pane says why.
+
+### When the user closes your pane
+
+If your kb is gone from `kb list`, or `kb ctl -i N` says it isn't running,
+the user most likely wanted it out of the way. If the task can finish
+without them watching, carry on headless; if you can't tell whether they
+want you to go on, ask.
+
+`kb --headless URL` runs a kb in the background, with the same commands and
+profile, and prints its number. It has a desktop viewport (1280x800, which
+`viewport reset` returns to) and no pane. Stop it with `kb ctl -i N quit`
+when you're done; one left behind quits after ten minutes without a command.
+`kb list` marks headless kbs.
 
 ## Selectors
 
-Anything that takes a selector accepts CSS (the first visible match is used;
-it reaches into shadow DOM, and `a >>> b` picks `b` inside `a`'s shadow
-root), `text=Some words` (the element showing that text), `@N` (a number
-from `kb ctl links`) or `:focus`.
+CSS (the first visible match; it reaches into shadow DOM, and `a >>> b`
+picks `b` inside `a`'s shadow root), `text=Some words` (the element showing
+them), `@N` (a number from `links`), or `:focus`.
 
 ## Testing your own pages
 
 After each change:
 
 ```sh
-k reload                         # or: k open URL. Waits for the load, reports errors
-k check                          # exit 1 on console errors, failed requests or an error page
-k screenshot --out /tmp/page.png # then read the image to look
+kb ctl -i N reload                          # or open URL; waits for the load, reports errors
+kb ctl -i N check                           # exit 1 on console errors, failed requests or an error page
+kb ctl -i N screenshot --out /tmp/page.png  # or your scratch directory; then read the image
 ```
 
-Then exercise what you changed:
+Then try what you changed. `kb ctl -i N html form` shows a form's fields
+with their ids and names:
 
 ```sh
-k click 'text=Save'              # fails if the element is hidden, off screen or covered
-k type '#email' 'a@b.co' --clear
-k select '#plan' Pro             # by value or label
-k press Enter
-k wait '.toast' --text Saved     # visible text only; --count N, --gone, --visible
-k console --errors
-k network --failed
+kb ctl -i N type '#email' 'a@b.co' --clear
+kb ctl -i N select '#plan' Pro          # by value or label
+kb ctl -i N click 'text=Save'           # fails if hidden, off screen or covered
+kb ctl -i N wait '#result' --text Saved # the element the click should change, and words you expect
+kb ctl -i N console --errors            # this page's; --all adds earlier pages'
+kb ctl -i N network --failed
 ```
 
-`click`, `type`, `press` and `select` answer once the page settles, and report
-the console errors and dialogs they caused and any change of page.
+`click`, `type`, `press` and `select` answer once the page settles, with the
+errors and dialogs they caused. What comes later (after a timer or a
+request) isn't there yet, so `wait` for it before reading. `wait --text`
+matches visible text, case and all; if you don't know the words, `wait
+SELECTOR --visible`, then `text SELECTOR`. `wait` also takes `--count N` and
+`--gone`.
 
 When something looks wrong or does nothing:
 
-- `k box SELECTOR`: where it is, whether it is rendered, what covers it.
-- `k style SELECTOR [property]`: computed CSS. `k style SELECTOR PROPERTY
-  --why` lists the rules that set it, the winner first, with file and line.
-- `k listeners SELECTOR`: its event listeners. Nothing listed means no handler
-  on the element itself; ask about its parent, which may handle the event.
-- `k storage` shows localStorage, sessionStorage and cookie names; `k storage
-  --clear` then `k reload` tests a first visit.
-- `k html SELECTOR`, `k eval 'JS'` (wrap declarations in `(() => { ... })()`).
+| Command | Shows |
+|---|---|
+| `box SELECTOR` | where it is, whether it's rendered, what covers it |
+| `style SELECTOR [PROPERTY] [--why]` | computed CSS; `--why` lists the rules that set it, winner first, with file and line |
+| `listeners SELECTOR` | its event listeners; none may mean a parent handles the event |
+| `storage [--clear]` | localStorage, sessionStorage and cookie names; `--clear` then `reload` tests a first visit |
+| `html SELECTOR`, `eval 'JS'` | anything else; wrap declarations in `(() => { ... })()` |
 
-Dark mode: `k scheme dark` (or `light`, or `auto` to follow the terminal).
+Also:
 
-Slow network (loading states, spinners): `k throttle slow` (or `fast`,
-`offline`), then `k throttle off`.
-
-Phone layout: `k viewport 375x800`, check it, then `k viewport reset`. A
-control hidden at that width makes `click` fail with "the element has no
-size", and `box` says why.
-
-Use the dev server's real address: read it from the server's output or the
-tool that started it, rather than guessing a port. Local pages (files,
-localhost, private addresses, `.local`, `.test`, `.vibe`) are never cached
-and `reload` bypasses the cache, so an edit always shows. A relative path
-given to `open` or `screenshot --out` is taken from your working directory.
+- **Dark mode:** `scheme dark` (or `light`, or `auto` to follow the terminal).
+- **Slow network:** `throttle slow` (or `fast`, `offline`), then `throttle off`.
+- **Phone layout:** `viewport 375x800`, look (`text` or a screenshot), then
+  `viewport reset` to return to the pane's size. A viewport stays set across
+  pages until reset. A control hidden at that width makes `click` fail with
+  "the element has no size".
+- **Dev servers:** use the address the server printed, not a guessed port.
+  Local pages (files, localhost, private addresses, `.local`, `.test`,
+  `.vibe`) are never cached, so an edit always shows. Relative paths for
+  `open` and `screenshot --out` start from your working directory.
 
 ## QA and test scripts
 
-For a script that runs unattended, assert with exit codes:
+A script is one shell, so a helper function works there. Assert with exit
+codes:
 
 ```sh
 set -e
+n=3                                              # your kb's number, from kb list
+k() { kb ctl -i "$n" "$@"; }
 k open "$base/login"
 k type '#user' tomsmith; k type '#pass' 'SuperSecretPassword!'
 k click 'button[type=submit]'
-k wait 'text=You logged into a secure area'   # fails after 10 s (--timeout)
+k wait 'text=You logged into a secure area'      # fails after 10 s (--timeout)
 [ "$(k text '#count')" = "3" ] || { echo "FAIL: expected 3 items"; exit 1; }
-k check --ignore optimizely.com,doubleclick.net   # third-party noise doesn't count
+k check --ignore optimizely.com,doubleclick.net  # third-party noise doesn't count
 ```
 
-- `text SELECTOR` prints a hidden element's text after a `(hidden: …)`
-  note, so compare whole output, or use `wait --text`, which only matches
-  visible text.
-- `click --double` double-clicks (editing in place, as in TodoMVC); `click
-  SELECTOR --at X,Y` clicks a point inside an element (a canvas, a map).
-- If a mouse click doesn't reach the page, which Chrome occasionally does
-  after a form submission, `click` falls back to clicking by script and says
-  so in its answer.
-- `alert`, `confirm` and `prompt` are accepted at once and reported by the
-  command that caused them; `k dialog dismiss` or `k dialog accept --text
-  TEXT` changes that for those that follow.
-- Count with `k wait SELECTOR --count N`, or `k eval 'document.querySelectorAll("li").length'`.
+- `text SELECTOR` prefixes a hidden element's text with `(hidden: …)`;
+  `wait --text` only matches visible text.
+- `click --double` double-clicks; `click SELECTOR --at X,Y` clicks a point
+  in an element (a canvas, a map). If the mouse click doesn't reach the
+  page, `click` clicks by script instead and says so.
+- `alert`, `confirm` and `prompt` are accepted and reported by the command
+  that caused them; `dialog dismiss` or `dialog accept --text TEXT` changes
+  that for later ones.
+- Count with `wait SELECTOR --count N`, or `eval` for anything no command
+  reads (an order, a count, one value).
 
 ## Reading and research
 
-Read pages with text, not screenshots; it is far cheaper:
+Read with text, not screenshots; it's far cheaper. The pane is often narrow,
+so set a desktop viewport first:
 
 ```sh
-k viewport 1280x800              # desktop layout: sidebars and menus show
-k open 'https://html.duckduckgo.com/html/?q=sqlite+fts5+bm25'
-k links --match sqlite.org       # results, with the real address behind redirects
-k click @3
-k outline                        # title and headings
-k text --section 'Ranking'       # just that section; the pane scrolls to it
-k find 'bm25'                    # every place it appears, with its section
-k tables; k tables 2             # list tables; print one as tab-separated rows
-k images                         # alt text, size, caption and source
+kb ctl -i N viewport 1280x800
+kb ctl -i N open 'https://html.duckduckgo.com/html/?q=sqlite+fts5+bm25'
+kb ctl -i N links --match sqlite.org      # results, with the real address behind redirects
+kb ctl -i N click @3
+kb ctl -i N text                          # the page's main content
+kb ctl -i N outline                       # title and headings
+kb ctl -i N text --section 'Ranking'      # one section, by its heading's words; scrolls to it
+kb ctl -i N find 'bm25'                   # every place it appears, with its section
+kb ctl -i N tables; kb ctl -i N tables 2  # list tables; print one as tab-separated rows
+kb ctl -i N images                        # alt text, size, caption and source
 ```
 
-When you cite a page, leave the passage on screen (`find` and `text
---section` scroll to it) so the user sees what you are quoting. `open`
-reports console errors and failed requests on every site; on third-party
-sites they are usually the site's own noise, not something to fix. A page
-titled like a bot check ("Just a moment", CAPTCHA) is named as one: kb can't
-get past it, so try another source. Many searches in quick succession get
-one, so search once, then read the results you got. Don't log in, post or submit forms other
-than searches unless the user asks.
+- When you cite a page, leave the passage on screen (`find` and
+  `text --section` scroll to it) so the user sees it.
+- Console errors on other people's sites are their noise, not yours to fix.
+- A bot check ("Just a moment", a CAPTCHA) is reported as one; kb can't pass
+  it, so try another source. Searching many times in a row brings one on:
+  search once, then read the results.
+- Don't log in, post, or submit forms other than searches unless the user
+  asks.
 
 ## Things to know
 
-- There are no tabs: one page per kb. Open a second pane to compare two pages.
-  A window the page opens (a sign-in popup, a link to a new tab) is shown
-  over it, and commands act on it; click and the other actions say so. When
-  it closes, or on `kb ctl back` from its first page, the page is shown again.
-- The pane is often narrow, so many sites show their phone layout until you
-  set a desktop viewport; `status` says when it is narrow.
-- Screenshots are one image pixel per CSS pixel (a 1280x800 viewport gives
-  1280x800). `--size small` halves that for a quick look, `--size sharp` gives
-  device pixels for fine detail, `--size 800` a given width. Prefer
-  `--selector CSS` for one element; `--full` pages are capped at 8000 pixels
-  tall.
+- One page per kb, no tabs; open a second pane to compare two pages.
+- A window the page opens (a sign-in popup, a new tab) is shown in its
+  place, and commands act on it. `click` says when one opens or closes, and
+  `status` counts them. A finished popup closes itself; to dismiss one,
+  `back` on its first page closes it.
+- Screenshots are one image pixel per CSS pixel. `--size small` halves
+  that, `--size sharp` gives device pixels, `--size 800` a set width.
+  Prefer `--selector CSS` for one element; `--full` pages stop at 8000
+  pixels tall.
 - kb doesn't look inside iframes; open the frame's own address instead.
