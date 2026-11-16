@@ -562,6 +562,9 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                             continue;
                         }
                     }
+                    if !app.chrome.shown(&message) {
+                        continue;
+                    }
                     app.devtools.observe(&message, &mut app.chrome);
                     match app.chrome.handle(message) {
                         Some(PageEvent::Frame(png)) => {
@@ -583,17 +586,11 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                             }
                         }
                         Some(PageEvent::Url(url)) => {
-                            log(format_args!("url {url}"));
-                            app.committed |= url != "about:blank";
-                            app.history.record(&url);
-                            app.url = if url == "about:blank" { String::new() } else { url };
-                            // An empty field waiting for an address gives way to
-                            // a page opened some other way (by an agent, a link).
-                            if app.bar.focused() && app.bar.text().is_empty() && !app.url.is_empty() {
-                                app.bar.blur(&app.url);
-                            } else if !app.bar.focused() {
-                                app.bar.set_text(&app.url);
-                            }
+                            app.went_to(url);
+                            redraw = true;
+                        }
+                        Some(PageEvent::Shown(url)) => {
+                            app.shown(url);
                             redraw = true;
                         }
                         Some(PageEvent::Loading(loading)) => {
@@ -797,7 +794,7 @@ impl App {
             let all = self.bindings.keys_for(action);
             all.iter().take(2).cloned().collect::<Vec<_>>().join(", ")
         };
-        for (action, does) in [
+        let rows = [
             (Action::Address, "edit the address"),
             (Action::Find, "find on the page; Enter, Shift+Enter: next, previous"),
             (Action::Back, "back (or the mouse's back button)"),
@@ -809,13 +806,20 @@ impl App {
             (Action::ZoomReset, "zoom to 100%, or out until the page fits"),
             (Action::Inspect, "inspect an element"),
             (Action::Devtools, "Chrome DevTools (start kb with --devtools)"),
+            (Action::NextWindow, "next window: a popup, a new tab (‹ › in the bar)"),
+            (Action::PreviousWindow, "previous window"),
+            (Action::CloseWindow, "close the window shown (✕); on the last one, ask to quit"),
             (Action::Help, "this help"),
-            (Action::Quit, "quit (the ✕ in the bar asks first)"),
-        ] {
-            let keys = keys(action);
-            if !keys.is_empty() {
-                lines.push(format!("{keys:<26}{does}"));
-            }
+            (Action::Quit, "quit (the ✕ in the bar closes a popup, or asks first)"),
+        ]
+        .map(|(action, does)| (keys(action), does))
+        .into_iter()
+        .filter(|(keys, _)| !keys.is_empty())
+        .collect::<Vec<_>>();
+        // As wide as the widest keys, so each description starts in line.
+        let width = rows.iter().map(|(keys, _)| keys.chars().count() + 2).max().unwrap_or(0);
+        for (keys, does) in rows {
+            lines.push(format!("{keys:<width$}{does}"));
         }
         lines.push(String::new());
         lines.push("\tChange keys in ~/.kittybrowser/keys; kb keys lists them.".to_owned());
@@ -867,7 +871,11 @@ impl App {
         let (cols, rows) = (self.window.cols, self.page_rows());
         let Some(splash) = &mut self.splash else { return };
         let mut out = b"\x1b[?2026h".to_vec();
-        splash.draw(&mut out, cols, rows, cell, 2);
+        if self.help {
+            crate::splash::Splash::hide(&mut out);
+        } else {
+            splash.draw(&mut out, cols, rows, cell, 2);
+        }
         // The splash paints the pane black, help and all.
         self.help_rect = None;
         self.render_help(&mut out);
@@ -889,8 +897,58 @@ impl App {
         out.extend_from_slice(b"\x1b[?25l");
     }
 
+    /// Another window is shown, at `url`. Whether it is loading comes in
+    /// its own events.
+    fn shown(&mut self, url: String) {
+        self.loading = false;
+        self.went_to(url);
+    }
+
+    /// Close the window shown, as a browser's tab closes; the last one is
+    /// kb itself, so that asks first.
+    fn close_window(&mut self) {
+        if self.chrome.windows().1 > 1 {
+            self.chrome.close_window();
+        } else {
+            self.asking_quit = true;
+        }
+    }
+
+    fn switch_window(&mut self, step: isize) {
+        if let Some(PageEvent::Shown(url)) = self.chrome.switch(step) {
+            self.shown(url);
+        }
+    }
+
+    /// The page shown is at `url` now.
+    fn went_to(&mut self, url: String) {
+        log(format_args!("url {url}"));
+        self.committed |= url != "about:blank";
+        self.history.record(&url);
+        self.url = if url == "about:blank" { String::new() } else { url };
+        // An empty field waiting for an address gives way to
+        // a page opened some other way (by an agent, a link).
+        if self.bar.focused() && self.bar.text().is_empty() && !self.url.is_empty() {
+            self.bar.blur(&self.url);
+        } else if !self.bar.focused() {
+            self.bar.set_text(&self.url);
+        }
+    }
+
+    /// Show the help box, or the panel set for it. The logo, an image,
+    /// would cover it, so it is hidden meanwhile.
+    fn open_help(&mut self) {
+        self.help = true;
+        if let Some(splash) = &mut self.splash {
+            splash.again();
+        }
+    }
+
     fn close_help(&mut self) {
         self.help = false;
+        if let Some(splash) = &mut self.splash {
+            splash.again();
+        }
         if self.panel.take().is_some() {
             self.chrome.evaluate(UNHOVER);
         }
@@ -997,8 +1055,10 @@ impl App {
         let badge = (!badge.is_empty()).then_some(badge);
         match &mut self.find {
             _ if self.asking_quit => ui::render_question(&mut out, ui::QUIT_QUESTION, cols),
-            Some(field) => ui::render_bar(&mut out, field, cols, self.loading, Some("Find"), badge),
-            None => ui::render_bar(&mut out, &mut self.bar, cols, self.loading, None, badge),
+            Some(field) => {
+                ui::render_bar(&mut out, field, cols, self.loading, Some("Find"), badge, self.chrome.windows())
+            }
+            None => ui::render_bar(&mut out, &mut self.bar, cols, self.loading, None, badge, self.chrome.windows()),
         }
         self.render_help(&mut out);
         out.extend_from_slice(b"\x1b[?2026l");
@@ -1097,10 +1157,15 @@ impl App {
             Action::Back => self.chrome.back(),
             Action::Forward => self.chrome.forward(),
             Action::Reload => self.chrome.reload(),
+            // With one window, the key goes to the page.
+            Action::NextWindow | Action::PreviousWindow if self.chrome.windows().1 == 1 => return false,
+            Action::NextWindow => self.switch_window(1),
+            Action::PreviousWindow => self.switch_window(-1),
+            Action::CloseWindow => self.close_window(),
             Action::ZoomIn => self.step_zoom(true),
             Action::ZoomOut => self.step_zoom(false),
             Action::ZoomReset => self.zoom_to_fit(),
-            Action::Help => self.help = true,
+            Action::Help => self.open_help(),
             Action::Copy => {
                 // The field being edited, or the page: the page reports what
                 // it copies, and kb passes it to the clipboard.
@@ -1180,7 +1245,7 @@ impl App {
             lines.push(String::new());
             lines.push(format!("\tThe selector is copied. {again} inspects another; any key closes this."));
             self.panel = Some(lines);
-            self.help = true;
+            self.open_help();
             return true;
         }
         false
@@ -1281,9 +1346,11 @@ impl App {
         if py < cell_h && self.buttons == 0 {
             let col = (px / cell_w) as usize + 1;
             if mouse.kind == MouseKind::Move {
-                let shape = match ui::hit(col, self.window.cols as usize) {
+                let shape = match ui::hit(col, self.window.cols as usize, self.chrome.windows()) {
                     Hit::Address(_) => "text",
-                    Hit::Back | Hit::Forward | Hit::Reload | Hit::Close => "pointer",
+                    Hit::Back | Hit::Forward | Hit::Reload | Hit::Close | Hit::PreviousWindow | Hit::NextWindow => {
+                        "pointer"
+                    }
                     Hit::Nothing => "default",
                 };
                 self.set_pointer(shape);
@@ -1291,23 +1358,25 @@ impl App {
             if mouse.kind != MouseKind::Press || mouse.button != Some(Button::Left) {
                 return false;
             }
-            if ui::hit(col, self.window.cols as usize) == Hit::Close {
-                self.asking_quit = true;
+            if ui::hit(col, self.window.cols as usize, self.chrome.windows()) == Hit::Close {
+                self.close_window();
                 return true;
             }
             if let Some(field) = &mut self.find {
-                if let Hit::Address(offset) = ui::hit(col, self.window.cols as usize) {
+                if let Hit::Address(offset) = ui::hit(col, self.window.cols as usize, self.chrome.windows()) {
                     field.click(offset);
                 }
                 return true;
             }
-            match ui::hit(col, self.window.cols as usize) {
+            match ui::hit(col, self.window.cols as usize, self.chrome.windows()) {
                 Hit::Back => self.chrome.back(),
                 Hit::Forward => self.chrome.forward(),
                 Hit::Reload if self.loading => self.chrome.stop(),
                 Hit::Reload => self.chrome.reload(),
                 Hit::Address(offset) if self.bar.focused() => self.bar.click(offset),
                 Hit::Address(_) => self.bar.focus(),
+                Hit::PreviousWindow => self.switch_window(-1),
+                Hit::NextWindow => self.switch_window(1),
                 Hit::Close | Hit::Nothing => {}
             }
             return true;
