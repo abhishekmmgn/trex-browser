@@ -32,8 +32,18 @@ pub fn idle() -> Duration {
     Duration::from_secs(seconds.unwrap_or(10 * 60))
 }
 
+/// How long the starting kb waits for the first page to load before
+/// handing over anyway, so a slow site can't hold it up.
+const FIRST_LOAD: Duration = Duration::from_secs(15);
+
 /// How often waits are checked, as in a pane.
 const TICK: Duration = Duration::from_millis(100);
+
+/// What the starting kb is told this one is called: its id, which no later
+/// kb takes.
+fn ready_name(instance: u32) -> String {
+    crate::control::id().unwrap_or_else(|| instance.to_string())
+}
 
 /// Whether this kb runs headless: `status` says so in place of a pane.
 pub fn running() -> bool {
@@ -63,11 +73,20 @@ pub fn start(args: &[String]) -> Result<(), String> {
     let mut child = command.spawn().map_err(|e| format!("starting kb: {e}"))?;
     let mut first = String::new();
     let _ = BufReader::new(child.stdout.take().ok_or("no output from kb")?).read_line(&mut first);
-    match first.trim().parse::<u32>() {
-        Ok(instance) => {
+    let mut words = first.split_whitespace();
+    let name = words.next().unwrap_or("").to_owned();
+    match name.split('-').next().unwrap_or("").parse::<u32>() {
+        Ok(_) => {
+            println!("kb {name}, headless");
+            if words.next() == Some("loading") {
+                println!(
+                    "the page is still loading after {} s; kb ctl -i {name} status says when it's done",
+                    FIRST_LOAD.as_secs()
+                );
+            }
             println!(
-                "kb {instance}, headless: kb ctl -i {instance} ... drives it, and kb ctl -i {instance} quit stops it \
-                 (it stops by itself after {} minutes without a command)",
+                "kb ctl -i {name} ... drives it, and kb ctl -i {name} quit stops it (it stops by itself after {} \
+                 minutes without a command)",
                 idle().as_secs() / 60
             );
             Ok(())
@@ -126,12 +145,19 @@ fn browse(options: Options, profile: &std::path::Path, claim: control::Claim) ->
     }
     let mut url = String::new();
     let mut loading = false;
-    if let Some(address) = options.url.as_deref().and_then(crate::ui::normalize_url) {
-        chrome.navigate(&address);
+    let address = options.url.as_deref().and_then(crate::ui::normalize_url);
+    if let Some(address) = &address {
+        chrome.navigate(address);
     }
     let mut devtools = Devtools::default();
-    // Ready: the starting kb is waiting for this line, and stops reading.
-    println!("{instance}");
+    // The starting kb waits for this line, with the number, as `kb ctl open`
+    // would for the page: until it has loaded, or for FIRST_LOAD at most.
+    let started = std::time::Instant::now();
+    let mut announced = address.is_none();
+    if announced {
+        println!("{}", ready_name(instance));
+    }
+    let mut seen_loading = false;
 
     let idle = idle();
     let mut last_command = std::time::Instant::now();
@@ -176,7 +202,14 @@ fn browse(options: Options, profile: &std::path::Path, claim: control::Claim) ->
                         let _ = request.reply.send(reply);
                     }
                     _ => {
-                        let page = Page { url: &url, loading, viewport, scale: options.scale, zoom: 1.0 };
+                        let page = Page {
+                            url: &url,
+                            loading,
+                            viewport,
+                            scale: options.scale,
+                            zoom: 1.0,
+                            viewport_set: viewport != VIEWPORT,
+                        };
                         devtools.command(request, &mut chrome, page);
                     }
                 }
@@ -190,7 +223,10 @@ fn browse(options: Options, profile: &std::path::Path, claim: control::Claim) ->
                     Some(PageEvent::Url(now) | PageEvent::Shown(now)) => {
                         url = if now == "about:blank" { String::new() } else { now };
                     }
-                    Some(PageEvent::Loading(now)) => loading = now,
+                    Some(PageEvent::Loading(now)) => {
+                        loading = now;
+                        seen_loading |= now;
+                    }
                     _ => {}
                 }
             }
@@ -199,6 +235,10 @@ fn browse(options: Options, profile: &std::path::Path, claim: control::Claim) ->
             Err(RecvTimeoutError::Disconnected) => break,
         }
         devtools.tick(&mut chrome);
+        if !announced && ((seen_loading && !loading) || started.elapsed() > FIRST_LOAD) {
+            announced = true;
+            println!("{}{}", ready_name(instance), if loading || !seen_loading { " loading" } else { "" });
+        }
     }
     chrome.close();
     Ok(())

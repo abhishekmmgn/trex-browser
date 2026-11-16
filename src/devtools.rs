@@ -257,7 +257,13 @@ const SECTION: &str = r#"((scope, want) => {
   const tags = 'h1, h2, h3, h4, h5, h6, [role=heading]';
   const within = scope ? [__kb.get(scope)] : __kb.roots();
   const heads = within.flatMap(r => [...r.querySelectorAll(tags)]).filter(h => __kb.shown(h));
-  const head = heads.find(h => __kb.label(h).toLowerCase() === w) || heads.find(h => __kb.label(h).toLowerCase().includes(w));
+  // Exactly, then as part of it, then by its words, whatever the punctuation:
+  // "bm25 function" finds "The bm25() function".
+  const words = t => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  const asked = words(want).split(' ').filter(Boolean);
+  const hasWords = h => { const l = ' ' + words(__kb.label(h)) + ' '; return asked.length && asked.every(x => l.includes(' ' + x + ' ')); };
+  const head = heads.find(h => __kb.label(h).toLowerCase() === w) || heads.find(h => __kb.label(h).toLowerCase().includes(w))
+    || heads.find(hasWords);
   if (!head) throw new Error('no heading reads ' + JSON.stringify(want) + '; see the headings with: kb ctl outline');
   // Show the user the part being read.
   head.scrollIntoView({block: 'start', behavior: 'instant'});
@@ -700,6 +706,9 @@ pub struct Page<'a> {
     pub scale: f64,
     /// Browser zoom, 1 for 100%.
     pub zoom: f64,
+    /// Whether the viewport was set with `viewport`, rather than following
+    /// the pane (or a headless kb's default).
+    pub viewport_set: bool,
 }
 
 #[derive(Default)]
@@ -724,6 +733,8 @@ pub struct Devtools {
     document_error: Option<String>,
     /// `back` and `forward` waiting for the page to change.
     moving: Vec<(Reply, Instant)>,
+    /// `back` closing a window: answered once fewer are open than this.
+    closing: Vec<(Reply, usize, Instant)>,
     waits: Vec<Wait>,
     next_wait: u64,
     settling: Vec<Settling>,
@@ -1122,8 +1133,14 @@ impl Devtools {
                         zoom if (zoom - 1.0).abs() < 0.001 => String::new(),
                         zoom => format!(", zoomed to {:.0}%", zoom * 100.0),
                     };
+                    // So "put the size back" isn't a guess: reset undoes a set size.
+                    let source = match (page.viewport_set, crate::headless::running()) {
+                        (true, _) => "set with viewport; viewport reset undoes it",
+                        (false, true) => "a headless kb's default",
+                        (false, false) => "follows the pane",
+                    };
                     let mut rest = format!(
-                        "loading: {}\nviewport: {width}x{height} CSS pixels, scale {}{zoom}\n{}",
+                        "loading: {}\nviewport: {width}x{height} CSS pixels ({source}), scale {}{zoom}\n{}",
                         if page.loading { "yes" } else { "no" },
                         (page.scale * 1000.0).round() / 1000.0,
                         self.health(),
@@ -1139,6 +1156,9 @@ impl Devtools {
                         ),
                     };
                     rest.push_str(&windows);
+                    if let Some(id) = crate::control::id() {
+                        let _ = write!(rest, "\nid: {id}");
+                    }
                     if crate::headless::running() {
                         let _ = write!(
                             rest,
@@ -1151,7 +1171,7 @@ impl Devtools {
                     if width < 600 {
                         rest.push_str(
                             "\nnote: the viewport is narrow, so many sites show their phone layout, with menus \
-                             collapsed; kb ctl viewport 1280x800 lays pages out as on a desktop",
+                             collapsed; kb ctl viewport 1280 lays pages out as on a desktop",
                         );
                     }
                     // The title has to be asked for; the rest is already known.
@@ -1188,24 +1208,15 @@ impl Devtools {
                     }
                 }
                 "console" => {
-                    let mut out = String::new();
                     let (all, errors) = (flag("all"), flag("errors"));
-                    for message in self.console.iter().filter(|m| all || m.seq >= self.page_seq) {
-                        let wanted = match message.level.as_str() {
-                            PAGE => all,
-                            "error" => true,
-                            _ => !errors,
-                        };
-                        if wanted {
-                            out.push_str(&message.line());
-                            out.push('\n');
-                        }
-                    }
+                    let mut out = self.console_lines(all, errors);
                     if !self.page_console().any(|m| !errors || m.level == "error") {
+                        // After earlier pages' messages, say which page this is about.
                         let _ = write!(
                             out,
-                            "no console {} since the page loaded",
-                            if errors { "errors" } else { "messages" }
+                            "no console {} {}",
+                            if errors { "errors" } else { "messages" },
+                            if all { "on the current page since it loaded" } else { "since the page loaded" }
                         );
                     }
                     text(&reply, out.trim_end());
@@ -1691,6 +1702,30 @@ impl Devtools {
         }
     }
 
+    /// The console messages wanted, this page's or with `all` every page's,
+    /// each earlier page under a header, given only when it has messages.
+    fn console_lines(&self, all: bool, errors: bool) -> String {
+        let mut out = String::new();
+        let mut header = None;
+        for message in self.console.iter().filter(|m| all || m.seq >= self.page_seq) {
+            let wanted = match message.level.as_str() {
+                PAGE => {
+                    header = all.then(|| message.line());
+                    false
+                }
+                "error" => true,
+                _ => !errors,
+            };
+            if wanted {
+                for line in header.take().into_iter().chain([message.line()]) {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
     fn log(&mut self, level: &str, text: String, source: String) {
         if self.console.len() == MAX_CONSOLE {
             self.console.pop_front();
@@ -2026,8 +2061,10 @@ impl Devtools {
                     }
                     // The first page of a window a page opened: back is closing it.
                     None if step < 0 && chrome.windows().1 > 1 => {
-                        let under = chrome.close_window();
-                        text(&reply, format!("closed this window, which had no earlier page; shown again: {under}"));
+                        // Answered once it has closed, so a status right after agrees.
+                        let open = chrome.windows().1;
+                        chrome.close_window();
+                        self.closing.push((reply, open, Instant::now() + MOVE_TIMEOUT));
                     }
                     None => fail(
                         &reply,
@@ -2099,6 +2136,18 @@ impl Devtools {
             }
         }
 
+        let open = chrome.windows().1;
+        self.closing.retain(|(reply, before, deadline)| {
+            if open < *before {
+                let under = chrome.url();
+                text(reply, format!("closed this window, which had no earlier page; shown again: {under}"));
+                return false;
+            }
+            if *deadline <= now {
+                fail(reply, "the window didn't close");
+            }
+            *deadline > now
+        });
         self.moving.retain(|(reply, deadline)| {
             if *deadline <= now {
                 fail(reply, "the page didn't change");
@@ -2254,5 +2303,14 @@ mod tests {
             "\nthis caused 1 console error:\n[error] Uncaught TypeError: x is null (app.js:9)"
         );
         assert_eq!(tools.console[1].line(), "--- page: https://site.test/ ---");
+
+        // Every page's, with a header only for pages that logged something.
+        tools.new_page("loader-2", "https://quiet.test/");
+        tools.new_page("loader-3", "https://site.test/next");
+        tools.log("error", "late".into(), String::new());
+        let all = tools.console_lines(true, true);
+        assert!(all.contains("--- page: https://site.test/ ---"), "{all}");
+        assert!(!all.contains("quiet.test"), "{all}");
+        assert!(all.contains("--- page: https://site.test/next ---\n[error] late"), "{all}");
     }
 }
