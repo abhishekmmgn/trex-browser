@@ -255,20 +255,6 @@ five in kitty). So each tick scrolls the page by one row of the pane,
 in CSS pixels for the zoom and fit in effect: the page stays under the
 fingers, and a notch moves it as far as the terminal's own scrollback would.
 
-Fingers swiping up or down drift sideways, and the terminal reports that as
-ticks across mixed in (Rex sent one left for every two or three up). Pages
-with a sideways-scrolling row of cards then shift it, and it snaps back. So
-a swipe keeps to one axis, as in browsers (`scroll::AxisLock`): its first
-tick's, until the latest dozen ticks go the other way at least twice as
-often, and a pause of a quarter second starts a new swipe. A wheel with a key held goes
-as it comes.
-
-Chrome on macOS stretches the page past its ends and springs it back
-(elastic overscroll) for these wheel events, which with no fingers on glass
-looks like the page shifting at the top, the bottom, and sideways. A style
-sheet adopted into each document sets `overscroll-behavior: none` on the
-root, which turns that off and does nothing else there.
-
 The kitty keyboard protocol's first level is switched on, so in terminals
 that have it Esc, and keys held with Ctrl, Alt or Command, arrive as
 `CSI code ; modifiers u` and can't be mistaken for anything else. That is

@@ -8,7 +8,6 @@ use crate::devtools::{Devtools, Page};
 use crate::engine::chrome::{self, Chrome, PageEvent};
 use crate::history::History;
 use crate::keys::{Action, Bindings};
-use crate::scroll::AxisLock;
 use crate::term::input::{Button, Event, Key, KeyCode, Mouse, MouseKind, Parser};
 use crate::term::page::{PageImage, Route};
 use crate::term::size::{self, Window};
@@ -177,25 +176,6 @@ fn log(line: std::fmt::Arguments) {
     }
 }
 
-/// Trace what the terminal sent: each mouse report as it came (the wheel's
-/// button code is 64 up, 65 down, 66 left, 67 right, plus 4 Shift, 8 Alt and
-/// 16 Ctrl), and the answers to the status query sent after each frame.
-fn trace_input(bytes: &[u8]) {
-    let text = String::from_utf8_lossy(bytes);
-    let mut reports = Vec::new();
-    for part in text.split('\x1b').skip(1) {
-        if let Some(report) = part.strip_prefix("[<") {
-            let end = report.find(['M', 'm']).map_or(report.len(), |end| end + 1);
-            reports.push(&report[..end]);
-        } else if part.starts_with("[0n") {
-            crate::trace::line(format_args!("terminal took the frame"));
-        }
-    }
-    if !reports.is_empty() {
-        crate::trace::line(format_args!("in {}B: {}", bytes.len(), reports.join(" ")));
-    }
-}
-
 /// How far one wheel tick scrolls the page, in CSS pixels across and down:
 /// one column or one row of the pane it is shown in. Terminals report a
 /// trackpad by sending a tick each time the fingers move a row's height (a
@@ -208,8 +188,6 @@ fn wheel_step(viewport: (u32, u32), shown: (u16, u16)) -> (f64, f64) {
 
 struct App {
     chrome: Chrome,
-    /// Keeps a trackpad swipe to the direction it mostly goes.
-    axis_lock: AxisLock,
     scale: f64,
     window: Window,
     /// Cell size from a terminal query or Rex, for terminals whose window
@@ -350,9 +328,6 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         loop {
             match stdin.read(&mut buf) {
                 Ok(n) if n > 0 => {
-                    if crate::trace::on() {
-                        trace_input(&buf[..n]);
-                    }
                     for event in parser.feed(&buf[..n]) {
                         if input.send(Msg::Term(event)).is_err() {
                             return;
@@ -423,7 +398,6 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         panel: None,
         asking_quit: false,
         quit_clicked: false,
-        axis_lock: AxisLock::default(),
     };
     if let Some(dark) = options.dark {
         app.chrome.color_scheme(Some(dark));
@@ -480,15 +454,10 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                 Msg::Term(Event::Mouse(mut mouse)) => {
                     // A burst of wheel ticks scrolls once, by all of them,
                     // rather than sending Chrome a scroll for each row.
-                    let mut merged = 1;
                     while let Some((_, Msg::Term(Event::Mouse(next)))) = messages.peek() {
                         let Some(sum) = mouse.add_wheel(next) else { break };
                         mouse = sum;
-                        merged += 1;
                         messages.next();
-                    }
-                    if let MouseKind::Wheel(dx, dy) = mouse.kind {
-                        crate::trace::scroll!("merge ticks {dx},{dy} from {merged} reports");
                     }
                     // A burst of moves collapses to the last one.
                     let next_is_move = matches!(
@@ -628,11 +597,6 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                     match app.chrome.handle(message) {
                         Some(PageEvent::Frame(png)) => {
                             let fits = app.fits(&png);
-                            crate::trace::scroll!(
-                                "frame-use fits={fits} same={} splash={}",
-                                app.frame.as_deref() == Some(png.as_str()),
-                                app.splash.is_some() && !app.committed
-                            );
                             log(format_args!(
                                 "frame {:?}, {} bytes, fits: {fits}",
                                 graphics::png_size(&png),
@@ -719,7 +683,6 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         }
         // One frame per gap, or all of them while the page is in use.
         while app.chrome.ack_pending() && app.last_ack.elapsed() >= app.frame_gap() {
-            crate::trace::scroll!("ack gap={:?}", app.frame_gap());
             app.chrome.ack();
             if !app.frame_gap().is_zero() {
                 app.last_ack = Instant::now();
@@ -1086,7 +1049,6 @@ impl App {
     fn draw(&mut self, frame: bool) {
         // Synchronized update, so the terminal shows the result in one go.
         let mut out = b"\x1b[?2026h".to_vec();
-        let mut traced_frame = false;
         let cell = self.cell();
         let frame = frame && (self.splash.is_none() || self.committed);
         if frame && self.splash.take().is_some() {
@@ -1100,15 +1062,8 @@ impl App {
                 (false, false) => Route::Layers,
                 (false, true) => Route::Png,
             };
-            let started = crate::trace::now();
             let drawn = self.page.draw(&mut out, png, route, scaled, cols, rows, cell, 2);
             log(format_args!("drew {drawn}"));
-            crate::trace::scroll!(
-                "draw {route:?} {drawn} prepare={:.1}ms out={}B",
-                crate::trace::now() - started,
-                out.len()
-            );
-            traced_frame = true;
         }
         let cols = self.window.cols as usize;
         let mut badge = String::new();
@@ -1140,16 +1095,7 @@ impl App {
         }
         self.render_help(&mut out);
         out.extend_from_slice(b"\x1b[?2026l");
-        if traced_frame {
-            // The terminal answers this status query once it has taken
-            // in everything before it: the frame's arrival, traced.
-            out.extend_from_slice(b"\x1b[5n");
-        }
-        let started = crate::trace::now();
         term::write(&out);
-        if traced_frame {
-            crate::trace::scroll!("written {}B in {:.1}ms", out.len(), crate::trace::now() - started);
-        }
     }
 
     /// Open the find field in the address bar's place.
@@ -1540,18 +1486,9 @@ impl App {
             }
             MouseKind::Wheel(dx, dy) => {
                 let (step_x, step_y) = wheel_step(self.viewport, self.shown);
-                // With a key held the wheel may zoom, or scroll across on
-                // purpose, so only a plain swipe is kept to one axis.
-                let (dx, dy) = match modifiers {
-                    0 => self.axis_lock.filter(Instant::now(), dx, dy),
-                    _ => (dx, dy),
-                };
-                let (across, down) = (dx as f64 * step_x, dy as f64 * step_y);
-                crate::trace::scroll!(
-                    "send wheel deltaX={across:.1} deltaY={down:.1} at {x:.0},{y:.0} modifiers={modifiers}"
-                );
-                if (across, down) != (0.0, 0.0) {
-                    self.chrome.wheel(x, y, across, down, modifiers);
+                // A burst that cancels out (up and down) is no scroll at all.
+                if (dx, dy) != (0, 0) {
+                    self.chrome.wheel(x, y, dx as f64 * step_x, dy as f64 * step_y, modifiers);
                 }
             }
         }

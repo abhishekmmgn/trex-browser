@@ -30,20 +30,6 @@ pub enum PageEvent {
     Shown(String),
 }
 
-/// Chrome on macOS stretches the page past its ends and springs it back
-/// (elastic overscroll), and does it for the wheel events kb sends. With no
-/// fingers on glass to explain it, the page just shifts at the top, the
-/// bottom, and sideways. `overscroll-behavior: none` on the root turns it
-/// off and changes nothing else there; an adopted style sheet does it
-/// without adding to the page's DOM.
-const NO_BOUNCE: &str = r#"(() => {
-  try {
-    const sheet = new CSSStyleSheet();
-    sheet.replaceSync(':root { overscroll-behavior: none !important; }');
-    document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
-  } catch (e) {}
-})()"#;
-
 /// Run in every page before its own scripts: report what the page copies
 /// through the `__kbCopy` binding, so kb can put it on the terminal's
 /// clipboard. Headless Chrome's own clipboard goes nowhere.
@@ -542,7 +528,6 @@ impl Chrome {
         settings.push(("Emulation.setFocusEmulationEnabled", json!({"enabled": true})));
         settings.push(("Runtime.addBinding", json!({"name": "__kbCopy"})));
         settings.push(("Page.addScriptToEvaluateOnNewDocument", json!({"source": COPY_HOOK})));
-        settings.push(("Page.addScriptToEvaluateOnNewDocument", json!({"source": NO_BOUNCE})));
         for (method, params) in &settings {
             call(&mut tx, &mut rx, method, params.clone(), s)?;
         }
@@ -661,27 +646,6 @@ impl Chrome {
                 Some(PageEvent::Copy(params["payload"].as_str()?.to_owned()))
             }
             "Page.screencastFrame" => {
-                let meta = &params["metadata"];
-                crate::trace::scroll!(
-                    "frame from chrome scroll={},{} offsetTop={} pageScale={} device={}x{} chromeTime={} {}B",
-                    meta["scrollOffsetX"],
-                    meta["scrollOffsetY"],
-                    meta["offsetTop"],
-                    meta["pageScaleFactor"],
-                    meta["deviceWidth"],
-                    meta["deviceHeight"],
-                    meta["timestamp"],
-                    params["data"].as_str().map_or(0, str::len)
-                );
-                // KB_TRACE_FRAMES=<dir> keeps every frame, named by its trace time.
-                if let (true, Some(dir), Some(data)) =
-                    (crate::trace::on(), std::env::var_os("KB_TRACE_FRAMES"), params["data"].as_str())
-                {
-                    if let Some(bytes) = crate::base64::decode(data) {
-                        let name = format!("{:010.2}.png", crate::trace::now());
-                        let _ = std::fs::write(std::path::Path::new(&dir).join(name), bytes);
-                    }
-                }
                 // Chrome stops sending frames until each one is acknowledged.
                 self.check_frame_size(&params["metadata"]);
                 let ack = json!({"sessionId": params["sessionId"]});
