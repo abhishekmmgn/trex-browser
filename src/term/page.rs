@@ -14,6 +14,8 @@ pub struct PageImage {
     layers: Layers,
     /// The last frame written whole to a file.
     last_file: Option<std::path::PathBuf>,
+    /// The terminal unlinks temporary JPEG transfer files after reading them.
+    jpeg_files: Vec<std::path::PathBuf>,
     /// Which drew the images on screen, if any.
     on_screen: Option<Drawer>,
 }
@@ -72,9 +74,32 @@ impl PageImage {
 
     /// Remove the last frame's file, should the terminal not have.
     pub fn close(&mut self) {
+        for path in self.jpeg_files.drain(..) {
+            let _ = std::fs::remove_file(path);
+        }
         if let Some(path) = self.last_file.take() {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    /// Present a decoded JPEG through the same raw file protocol used for PNG tiles.
+    pub fn draw_pixels(&mut self, out: &mut Vec<u8>, pixels: &graphics::Pixels, (cols, rows): (u16, u16)) -> bool {
+        // A queued transfer may still need its file when the next frame arrives.
+        // Fall back to PNG if the reader stops consuming files.
+        self.jpeg_files.retain(|path| !matches!(path.try_exists(), Ok(false)));
+        if self.jpeg_files.len() >= 8 {
+            return false;
+        }
+        let path = graphics::next_path();
+        if std::fs::write(&path, &pixels.data).is_err() {
+            let _ = std::fs::remove_file(path);
+            return false;
+        }
+        self.hand_to(out, Drawer::Whole);
+        out.extend_from_slice(b"\x1b[2;1H");
+        graphics::put_file(out, &path, pixels, cols, rows);
+        self.jpeg_files.push(path);
+        true
     }
 
     /// Append the escapes that draw `png`, one of Chrome's frames, over
@@ -145,6 +170,23 @@ impl PageImage {
 mod tests {
     use super::*;
     use crate::term::layers::tests::{encode, frame, Screen};
+
+    #[test]
+    fn jpeg_transfer_keeps_unread_frames_available() {
+        let mut image = PageImage::default();
+        let pixels = page(16, 0);
+        let mut out = Vec::new();
+        for _ in 0..8 {
+            assert!(image.draw_pixels(&mut out, &pixels, (4, 10)));
+        }
+        assert!(image.jpeg_files.iter().all(|path| path.exists()));
+        assert!(!image.draw_pixels(&mut out, &pixels, (4, 10)));
+        std::fs::remove_file(&image.jpeg_files[0]).unwrap();
+        assert!(image.draw_pixels(&mut out, &pixels, (4, 10)));
+        let pending = image.jpeg_files.clone();
+        image.close();
+        assert!(pending.iter().all(|path| !path.exists()));
+    }
 
     // 4 columns and 10 rows of 4x4 pixel cells, from screen row 2.
     const COLS: u16 = 4;

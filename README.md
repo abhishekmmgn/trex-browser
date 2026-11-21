@@ -263,6 +263,8 @@ it's worth knowing before you turn on the MCP server. See
 | `--devtools` | Serve Chrome DevTools on a port of 127.0.0.1, for F12 (any program on this machine can then reach the browser) |
 | `~/.kittybrowser/keys` | Key bindings; `kb keys` shows the format and what's bound |
 | `KB_CHROME` | The browser to run, if kb doesn't find one |
+| `KB_SLOW_SCROLL` | Set to `1` to split repeated slow vertical wheel ticks into two updates. The second half follows up to 33 ms later. |
+| `KB_FRAME_FORMAT` | Set to `jpeg` (quality 90) or `jpeg95` (quality 95) to try lossy frames in a local pane that accepts files. The default is PNG. |
 | `KB_CHROME_ARGS` | Extra flags for Chrome, separated by spaces |
 | `KB_TRANSFER=pty` | Always send frames through the terminal, never by file |
 | `KB_TRANSFER=png` | Through the terminal, and each frame whole as a PNG: for a terminal that shows kb's page broken over ssh |

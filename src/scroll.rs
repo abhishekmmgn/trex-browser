@@ -69,12 +69,50 @@ impl AxisLock {
     }
 }
 
+/// Split only repeated single vertical ticks at a stationary pointer. The first
+/// half moves immediately; the second is due halfway to the next expected tick.
+#[derive(Default)]
+pub struct SlowWheel {
+    previous: Option<(Instant, f64, f64, i32)>,
+    pub pending: Option<(Instant, f64, f64, f64)>,
+}
+
+impl SlowWheel {
+    pub fn vertical(&mut self, now: Instant, x: f64, y: f64, tick: i32, distance: f64) -> f64 {
+        let last = self.previous.replace((now, x, y, tick));
+        if let Some((at, px, py, direction)) = last {
+            let gap = now.saturating_duration_since(at);
+            if (px, py, direction) == (x, y, tick)
+                && (Duration::from_millis(32)..=Duration::from_millis(100)).contains(&gap)
+            {
+                let half = distance / 2.0;
+                self.pending = Some((now + (gap / 2).min(Duration::from_millis(33)), x, y, half));
+                return half;
+            }
+        }
+        distance
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// About how often a terminal reports a swipe: at 60 frames a second.
     const FRAME: Duration = Duration::from_micros(16_667);
+
+    #[test]
+    fn repeated_slow_ticks_keep_their_distance_and_start_immediately() {
+        let mut wheel = SlowWheel::default();
+        let start = Instant::now();
+        assert_eq!(wheel.vertical(start, 1.0, 2.0, 1, 20.5), 20.5);
+        let now = start + Duration::from_millis(60);
+        assert_eq!(wheel.vertical(now, 1.0, 2.0, 1, 20.5), 10.25);
+        assert_eq!(wheel.pending.take(), Some((now + Duration::from_millis(30), 1.0, 2.0, 10.25)));
+        assert_eq!(wheel.vertical(now + FRAME, 1.0, 2.0, 1, 20.5), 20.5);
+        assert_eq!(wheel.vertical(now + FRAME * 4, 1.0, 2.0, -1, -20.5), -20.5);
+        assert!(wheel.pending.is_none());
+    }
 
     /// Feed `ticks` (^ v < > for up, down, left, right) to a lock a frame
     /// apart, and return what it let through, the same way.

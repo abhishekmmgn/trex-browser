@@ -234,10 +234,15 @@ impl Window {
 /// How a base64 PNG starts.
 const PNG: &str = "iVBORw0KGgo";
 
-/// The top left part of a base64 PNG, `part` of its width and height, as a
+/// The top left part of a screencast frame, `part` of its width and height, as a
 /// base64 PNG.
-fn crop_png(data: &str, part: (f64, f64)) -> Option<String> {
-    let pixels = crate::term::graphics::decode_png(&crate::base64::decode(data)?, Vec::new())?;
+fn crop_to_png(data: &str, part: (f64, f64)) -> Option<String> {
+    let bytes = crate::base64::decode(data)?;
+    let pixels = if data.starts_with(PNG) {
+        crate::term::graphics::decode_png(&bytes, Vec::new())
+    } else {
+        crate::term::graphics::decode_jpeg(&bytes)
+    }?;
     let width = ((pixels.width as f64 * part.0).round() as u32).clamp(1, pixels.width);
     let height = ((pixels.height as f64 * part.1).round() as u32).clamp(1, pixels.height);
     let depth = if pixels.alpha { 4 } else { 3 };
@@ -678,7 +683,8 @@ impl Chrome {
                     (crate::trace::on(), std::env::var_os("KB_TRACE_FRAMES"), params["data"].as_str())
                 {
                     if let Some(bytes) = crate::base64::decode(data) {
-                        let name = format!("{:010.2}.png", crate::trace::now());
+                        let ext = if data.starts_with("/9j/") { "jpg" } else { "png" };
+                        let name = format!("{:010.2}.{ext}", crate::trace::now());
                         let _ = std::fs::write(std::path::Path::new(&dir).join(name), bytes);
                     }
                 }
@@ -930,7 +936,7 @@ impl Chrome {
     }
 
     /// The frame, cut to the viewport if it holds more (see `Window::crop`).
-    /// Only PNG frames are cut; kb draws JPEG ones only in kb bench.
+    /// Cropped frames use PNG so all renderers can display them.
     fn crop_frame(&self, data: String, metadata: &Value) -> Option<String> {
         let (Some(window), Some((width, height)), Some(css_width), Some(css_height)) = (
             &self.tabs[self.shown].window,
@@ -941,10 +947,10 @@ impl Chrome {
             return Some(data);
         };
         let viewport = (width as i64, height as i64);
-        if !window.crop(viewport, (css_width.round() as i64, css_height.round() as i64)) || !data.starts_with(PNG) {
+        if !window.crop(viewport, (css_width.round() as i64, css_height.round() as i64)) {
             return Some(data);
         }
-        crop_png(&data, (width as f64 / css_width, height as f64 / css_height)).or(Some(data))
+        crop_to_png(&data, (width as f64 / css_width, height as f64 / css_height)).or(Some(data))
     }
 
     /// Fit the window to the viewport if this frame shows it cropping them.
@@ -1389,7 +1395,7 @@ mod tests {
         use crate::term::graphics::decode_png;
         use crate::term::layers::tests::{encode, frame};
         let png = encode(&frame(1000, 812, |x, y| ((x / 10 + y) % 251) as u8));
-        let cut = crop_png(&png, (413.0 / 500.0, 1.0)).unwrap();
+        let cut = crop_to_png(&png, (413.0 / 500.0, 1.0)).unwrap();
         let cut = decode_png(&crate::base64::decode(&cut).unwrap(), Vec::new()).unwrap();
         assert_eq!((cut.width, cut.height), (826, 812));
         let at = |x: u32, y: u32| cut.data[((y * 826 + x) * 3) as usize];
