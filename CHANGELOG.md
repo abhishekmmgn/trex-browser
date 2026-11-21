@@ -6,14 +6,47 @@ Notable changes to kb. The format follows
 
 ## Unreleased
 
+- `kb --name NAME` starts a kb that answers to `kb ctl -i NAME` and keeps
+  its cookies in a profile of its own (`~/.kittybrowser/profiles/NAME`),
+  whatever other kbs are running, so a site signed in to there stays signed
+  in after a restart. A second kb with the same name is refused. `kb list`
+  shows named kbs. `KB_SOCKET`, which shared the first kb's profile, is gone.
+- `kb mcp serve -i NAME` drives that kb only, and its instructions say so.
+  MCP number parameters (`timeout`, `limit`, `count`, `number`) are typed as
+  numbers and honoured; before, `{"timeout": 2}` was silently read as 10.
+- `kb ctl upload SELECTOR FILE...` chooses files for a file field, or clicks
+  a button and answers the file chooser it opens, and reports the files as
+  the page sees them. A click that opens a chooser says so.
+- `kb ctl window` lists the windows a page opened, and `window N` shows one
+  without closing the others.
+- Selectors reach into an iframe from the same site with `iframe >>> sel`.
+  A click that lands inside a frame no longer counts as missed, which made
+  kb click the frame a second time by script.
+- `KB_HEADLESS_IDLE=0` keeps a headless kb running until told to quit.
+- When Chrome doesn't answer within 20 s of starting, or a headless kb's
+  first page never starts to load, kb stops and says why (on macOS, it can
+  be waiting for the keychain) rather than leave every command to time out
+  after 70 s. A
+  command Chrome never answers fails after 30 s, saying so.
+- A socket path too long for Unix (a long `HOME`) is refused with a clear
+  message. kb's profiles are readable only by the user (0700). A quitting kb
+  frees its number or name at once, and a kb that can't read the terminal
+  size no longer leaves its socket behind.
+
+- An Intel build of kb on Apple Silicon starts Chrome natively. It used to
+  start it under Rosetta as well, where JavaScript ran about six times
+  slower, and a page that works hard in script could hold the page's thread
+  until kb's commands timed out. The client hints now give the machine's
+  architecture rather than kb's build's, and `kb doctor` notes an Intel
+  build.
 - Scrolling follows the trackpad: each wheel tick the terminal sends moves
   the page one row of the pane, rather than 60 CSS pixels, which made a
   trackpad several times too fast. A mouse wheel moves as many rows a notch
   as the terminal's own scrollback, and a burst of ticks reaches the page
   as one scroll.
 - `kb --headless URL` runs kb in the background without a pane, driven by
-  `kb ctl` alone, with the same profile and commands. It prints its number,
-  `kb ctl -i N quit` stops it (and quits any kb), and it stops by itself
+  `kb ctl` alone, with the same profile and commands. It prints its id,
+  `kb ctl -i ID quit` stops it (and quits any kb), and it stops by itself
   after ten minutes without a command (`KB_HEADLESS_IDLE`). The skill has
   agents finish this way when the user closes their pane to get it out of
   the way. It answers once the first page has loaded, as `kb ctl open`

@@ -15,7 +15,12 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// How long Chrome gets to start and answer kb before kb gives up on it.
+const STARTUP: Duration = Duration::from_secs(20);
 
 /// What the app needs to hear about from the page.
 pub enum PageEvent {
@@ -325,6 +330,8 @@ fn agent_metadata(product: &str, binary: &Path) -> Value {
     let long: Vec<Value> = brands.iter().map(|b| json!({"brand": b.0, "version": b.2})).collect();
     let (platform, architecture) = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => ("macOS", "arm"),
+        // The machine's, not kb's: Chrome runs natively even when kb doesn't.
+        ("macos", _) if translated() => ("macOS", "arm"),
         ("macos", _) => ("macOS", "x86"),
         (_, "aarch64") => ("Linux", "arm"),
         _ => ("Linux", "x86"),
@@ -340,6 +347,24 @@ fn agent_metadata(product: &str, binary: &Path) -> Value {
         "model": "",
         "mobile": false,
     })
+}
+
+/// Whether kb is an Intel build running under Rosetta on Apple Silicon. A
+/// program it starts would run under Rosetta too, and Chrome's JavaScript
+/// would be compiled for Intel and then translated: many times slower, so
+/// much that pages that work hard in script never finish loading.
+#[cfg(target_os = "macos")]
+pub fn translated() -> bool {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let name = c"sysctl.proc_translated";
+    let got = unsafe { libc::sysctlbyname(name.as_ptr(), (&raw mut value).cast(), &mut len, std::ptr::null_mut(), 0) };
+    got == 0 && value == 1
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn translated() -> bool {
+    false
 }
 
 /// The system's version, as Chrome reports it: macOS's ("26.0.1").
@@ -438,6 +463,16 @@ fn call(
     }
 }
 
+/// Chrome's first page, once kb has attached to it and set it up.
+struct Attached {
+    target: String,
+    session: String,
+    window: Option<Window>,
+    /// What every window is told: see `Chrome::settings`.
+    settings: Vec<(&'static str, Value)>,
+    main_frame: String,
+}
+
 impl Chrome {
     /// Start Chrome on `profile` and attach to its page. The receiver is
     /// returned separately so a thread can block on it.
@@ -451,7 +486,16 @@ impl Chrome {
         let (in_fd, out_fd) = (child_in.as_raw_fd(), child_out.as_raw_fd());
 
         quiet_profile(profile);
-        let mut command = Command::new(&binary);
+        // Under Rosetta, ask for Chrome's Apple Silicon half, or its Intel
+        // one if it has no other.
+        let mut command = match translated() {
+            true => {
+                let mut arch = Command::new("/usr/bin/arch");
+                arch.args(["-arm64", "-x86_64"]).arg(&binary);
+                arch
+            }
+            false => Command::new(&binary),
+        };
         command
             .arg("--headless=new")
             .arg("--remote-debugging-pipe")
@@ -459,8 +503,8 @@ impl Chrome {
             .arg(format!("--force-device-scale-factor={scale}"))
             .args(["--hide-scrollbars", "--no-first-run", "--no-default-browser-check"])
             .arg("--disable-features=PasswordManagerOnboarding,AutofillServerCommunication")
-            // Otherwise navigator.webdriver is true, which sites such as
-            // Google take as a robot and answer with a captcha.
+            // Otherwise navigator.webdriver is true, which some sites take
+            // as a robot and answer with a captcha.
             .arg("--disable-blink-features=AutomationControlled")
             .args(if devtools {
                 &["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1"][..]
@@ -487,53 +531,38 @@ impl Chrome {
         let mut tx = Sender::new(File::from(to_chrome));
         let mut rx = Receiver::new(File::from(from_chrome));
 
-        let targets = call(&mut tx, &mut rx, "Target.getTargets", json!({}), None)?;
-        let page = targets["targetInfos"]
-            .as_array()
-            .and_then(|infos| infos.iter().find(|info| info["type"] == "page"))
-            .and_then(|info| info["targetId"].as_str().map(str::to_owned));
-        let target = match page {
-            Some(target) => target,
-            None => {
-                let created = call(&mut tx, &mut rx, "Target.createTarget", json!({"url": "about:blank"}), None)?;
-                created["targetId"].as_str().ok_or("Chrome gave no page")?.to_owned()
-            }
-        };
-        let attached =
-            call(&mut tx, &mut rx, "Target.attachToTarget", json!({"targetId": target, "flatten": true}), None)?;
-        let session = attached["sessionId"].as_str().ok_or("Chrome gave no session")?.to_owned();
-        let s = Some(session.as_str());
-        // The window holding the page, and its size, for `check_frame_size`.
-        let window = call(&mut tx, &mut rx, "Browser.getWindowForTarget", json!({"targetId": target}), None)
-            .ok()
-            .and_then(|reply| {
-                let bounds = &reply["bounds"];
-                Some(Window::new(reply["windowId"].as_u64()?, (bounds["width"].as_i64()?, bounds["height"].as_i64()?)))
+        // Chrome can hang before it answers at all, as when it waits on the
+        // macOS keychain; kb would then wait for ever without saying why.
+        // Stopping Chrome closes the pipe, which ends the wait below.
+        let started = Arc::new(AtomicBool::new(false));
+        let stalled = Arc::new(AtomicBool::new(false));
+        {
+            let (started, stalled, pid) = (started.clone(), stalled.clone(), child.id() as libc::pid_t);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + STARTUP;
+                while Instant::now() < deadline {
+                    if started.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if !started.load(Ordering::SeqCst) {
+                    stalled.store(true, Ordering::SeqCst);
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
             });
-
-        // Console, log and network events feed `kb ctl console` and `network`.
-        let mut settings: Vec<(&'static str, Value)> =
-            ["Page.enable", "Runtime.enable", "Log.enable", "Network.enable"].map(|domain| (domain, json!({}))).into();
-        // Some sites turn away anything that calls itself headless. The
-        // client hints go with the name: overriding it alone leaves them
-        // empty, which is a robot's mark too.
-        let version = call(&mut tx, &mut rx, "Browser.getVersion", json!({}), None)?;
-        if let (Some(agent), Some(product)) = (version["userAgent"].as_str(), version["product"].as_str()) {
-            let agent = agent.replace("HeadlessChrome", "Chrome");
-            let metadata = agent_metadata(product, &binary);
-            settings
-                .push(("Emulation.setUserAgentOverride", json!({"userAgent": agent, "userAgentMetadata": metadata})));
         }
-        // Without this the page believes it is in the background: no caret, no focus styles.
-        settings.push(("Emulation.setFocusEmulationEnabled", json!({"enabled": true})));
-        settings.push(("Runtime.addBinding", json!({"name": "__kbCopy"})));
-        settings.push(("Page.addScriptToEvaluateOnNewDocument", json!({"source": COPY_HOOK})));
-        for (method, params) in &settings {
-            call(&mut tx, &mut rx, method, params.clone(), s)?;
-        }
-        let tree = call(&mut tx, &mut rx, "Page.getFrameTree", json!({}), s)?;
-        let main_frame = tree["frameTree"]["frame"]["id"].as_str().unwrap_or(&target).to_owned();
-        call(&mut tx, &mut rx, "Target.setDiscoverTargets", json!({"discover": true}), None)?;
+        let attached = Self::attach(&mut tx, &mut rx, &binary);
+        started.store(true, Ordering::SeqCst);
+        let Attached { target, session, window, settings, main_frame } =
+            attached.map_err(|error| match stalled.load(Ordering::SeqCst) {
+                true => format!(
+                    "Chrome didn't answer within {} s of starting, so kb stopped it. On macOS it can be waiting \
+                     for the keychain, as when HOME isn't the user's own; see Troubleshooting in kb's README",
+                    STARTUP.as_secs()
+                ),
+                false => error,
+            })?;
 
         let chrome = Chrome {
             child,
@@ -554,6 +583,59 @@ impl Chrome {
             window_reply: None,
         };
         Ok((chrome, rx))
+    }
+
+    /// Attach to Chrome's page and set it up.
+    fn attach(tx: &mut Sender, rx: &mut Receiver, binary: &Path) -> Result<Attached, String> {
+        let targets = call(tx, rx, "Target.getTargets", json!({}), None)?;
+        let page = targets["targetInfos"]
+            .as_array()
+            .and_then(|infos| infos.iter().find(|info| info["type"] == "page"))
+            .and_then(|info| info["targetId"].as_str().map(str::to_owned));
+        let target = match page {
+            Some(target) => target,
+            None => {
+                let created = call(tx, rx, "Target.createTarget", json!({"url": "about:blank"}), None)?;
+                created["targetId"].as_str().ok_or("Chrome gave no page")?.to_owned()
+            }
+        };
+        let attached = call(tx, rx, "Target.attachToTarget", json!({"targetId": target, "flatten": true}), None)?;
+        let session = attached["sessionId"].as_str().ok_or("Chrome gave no session")?.to_owned();
+        let s = Some(session.as_str());
+        // The window holding the page, and its size, for `check_frame_size`.
+        let window =
+            call(tx, rx, "Browser.getWindowForTarget", json!({"targetId": target}), None).ok().and_then(|reply| {
+                let bounds = &reply["bounds"];
+                Some(Window::new(reply["windowId"].as_u64()?, (bounds["width"].as_i64()?, bounds["height"].as_i64()?)))
+            });
+
+        // Console, log and network events feed `kb ctl console` and `network`.
+        let mut settings: Vec<(&'static str, Value)> =
+            ["Page.enable", "Runtime.enable", "Log.enable", "Network.enable"].map(|domain| (domain, json!({}))).into();
+        // Some sites turn away anything that calls itself headless. The
+        // client hints go with the name: overriding it alone leaves them
+        // empty, which is a robot's mark too.
+        let version = call(tx, rx, "Browser.getVersion", json!({}), None)?;
+        if let (Some(agent), Some(product)) = (version["userAgent"].as_str(), version["product"].as_str()) {
+            let agent = agent.replace("HeadlessChrome", "Chrome");
+            let metadata = agent_metadata(product, binary);
+            settings
+                .push(("Emulation.setUserAgentOverride", json!({"userAgent": agent, "userAgentMetadata": metadata})));
+        }
+        // Without this the page believes it is in the background: no caret, no focus styles.
+        settings.push(("Emulation.setFocusEmulationEnabled", json!({"enabled": true})));
+        settings.push(("Runtime.addBinding", json!({"name": "__kbCopy"})));
+        // Chrome is headless, so a file chooser has nowhere to show: kb
+        // answers it for `upload`, or says that one opened.
+        settings.push(("Page.setInterceptFileChooserDialog", json!({"enabled": true})));
+        settings.push(("Page.addScriptToEvaluateOnNewDocument", json!({"source": COPY_HOOK})));
+        for (method, params) in &settings {
+            call(tx, rx, method, params.clone(), s)?;
+        }
+        let tree = call(tx, rx, "Page.getFrameTree", json!({}), s)?;
+        let main_frame = tree["frameTree"]["frame"]["id"].as_str().unwrap_or(&target).to_owned();
+        call(tx, rx, "Target.setDiscoverTargets", json!({"discover": true}), None)?;
+        Ok(Attached { target, session, window, settings, main_frame })
     }
 
     // Send failures mean Chrome is gone; the reader thread reports that.
@@ -593,6 +675,16 @@ impl Chrome {
     /// Which window is shown, counting from 1, and how many are open.
     pub fn windows(&self) -> (usize, usize) {
         (self.shown + 1, self.tabs.len())
+    }
+
+    /// Where each open window is, in the order they opened in.
+    pub fn window_urls(&self) -> Vec<&str> {
+        self.tabs.iter().map(|tab| tab.url.as_str()).collect()
+    }
+
+    /// Show window `n`, counting from 1, if there is one.
+    pub fn show_window(&mut self, n: usize) -> Option<PageEvent> {
+        (1..=self.tabs.len()).contains(&n).then(|| self.show(n - 1)).flatten()
     }
 
     /// Whether the app should look at this message: replies, the browser's
