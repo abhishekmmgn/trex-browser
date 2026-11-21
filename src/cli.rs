@@ -11,7 +11,8 @@ fn usage() -> String {
          Controls the kb browser running in a terminal pane: what you do here\n\
          happens on the page the user is looking at. With several kbs running,\n\
          kb ctl -i ID <command> picks one, by the number, id or name kb list\n\
-         shows; the default is the lowest-numbered.\n\n",
+         shows. Without it: the kb in your Rex session, else the\n\
+         lowest-numbered.\n\n",
     );
     for command in COMMANDS {
         text.push_str(&format!("  {}\n      {}\n", command.synopsis(), command.help));

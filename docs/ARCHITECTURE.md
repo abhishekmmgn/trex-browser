@@ -341,10 +341,17 @@ same one. A kb started with `--name NAME` takes no number: its socket is
 its name is its id. Names start with a letter, so they can't be mistaken
 for numbers or ids. As a kb quits it removes its socket at once, before
 Chrome has closed, so the same name can start again straight away; and only
-if the socket is still its own, by inode. Clients go to the lowest-numbered
-kb unless `kb ctl -i N|ID|NAME` or `KB_INSTANCE` names another. Each client gets a thread that turns a request
-line into a `Request` carrying a reply channel, hands it to the app loop, and
-writes back whatever arrives.
+if the socket is still its own, by inode. Clients go to the kb that `kb ctl
+-i N|ID|NAME` or `KB_INSTANCE` names; else, run in Rex, to the kb beside
+them; else to the lowest-numbered. Each client gets a thread that turns a
+request line into a `Request` carrying a reply channel, hands it to the app
+loop, and writes back whatever arrives.
+
+"Beside" means drawn in a pane with the caller's `REX_SESSION`, so an
+agent reaches the kb it split, not the user's kb in another session. The
+client asks each kb `where` (id, pane, session); the socket's thread
+answers, not the app, so a page stuck in a script can't stall other kbs'
+commands. Several kbs there is an error that lists them.
 
 `devtools.rs` carries commands out on the app thread, which never blocks on
 Chrome. A command that needs an answer parks its reply channel in `pending`
