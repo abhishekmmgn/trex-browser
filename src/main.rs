@@ -16,6 +16,7 @@ mod headless;
 mod history;
 mod keys;
 mod mcp;
+mod rex;
 mod scroll;
 mod skill;
 mod splash;
