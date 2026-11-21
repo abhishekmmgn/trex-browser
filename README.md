@@ -251,11 +251,8 @@ into a frame from the same site), `text=Some words`, `@N` from
 `kb ctl links`, or `:focus`. With several kbs running, pick one with
 `kb ctl -i N` (its number in `kb list`), `-i ID` (its id, such as `3-a7f2`,
 which unlike the number isn't reused by a kb started later), or `-i NAME`.
-Without one, in Rex, `kb ctl` and the MCP server go to the kb in the
-caller's window, else its session, so an agent reaches the kb it opened
-beside itself rather than yours elsewhere; with several there they fail and
-list them. Outside Rex, or with none there, they go to the lowest-numbered
-kb.
+Without one, `kb ctl` and the MCP server go to the kb in the caller's Rex
+session, if there is one (several is an error), else the lowest-numbered.
 
 The same commands are available as an MCP server, which is off until you turn
 it on: `kb mcp on` (it prints how to register it with Claude Code), `kb mcp

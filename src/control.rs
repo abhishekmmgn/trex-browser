@@ -3,7 +3,8 @@
 //! A Unix socket in kb's data directory, readable only by the user. Each
 //! line sent is a JSON request, `{"command": ..., "args": {...}}`, and each
 //! gets one line back: `{"ok": true, "text": ...}`, `{"ok": true, "image":
-//! <base64 PNG>}` or `{"ok": false, "error": ...}`.
+//! <base64 PNG>}` or `{"ok": false, "error": ...}`. One request, `where`,
+//! is for clients looking for a kb, and the socket's thread answers it.
 
 use serde_json::{json, Value};
 use std::io::{self, BufRead, BufReader, Write};
@@ -221,14 +222,32 @@ impl Claim {
 }
 
 /// Connect to the kb that commands are meant for: the one KB_INSTANCE
-/// names; else, in Rex, the one in the caller's window, or else its
-/// session; else the lowest-numbered one running.
+/// names; else the one beside the caller in its terminal session; else the
+/// lowest-numbered one running.
 fn connect() -> Result<UnixStream, String> {
-    if let Some(chosen) = chosen_instance()? {
-        return connect_to(chosen);
+    let gone = |name: &str| format!("kb {name} isn't running; kb list shows the ones that are");
+    if let Some(Chosen::Name(name)) = chosen_instance()? {
+        return UnixStream::connect(named_socket(&name)?).map_err(|_| {
+            format!("{}; start it with: kb --headless --name {name} [URL], or kb --name {name} in a pane", gone(&name))
+        });
     }
-    if let Some(caller) = crate::rex::caller() {
-        if let Some(stream) = connect_beside(&caller)? {
+    if let Some(Chosen::Number(n, id)) = chosen_instance()? {
+        let socket = instance_socket(n)?;
+        if let Some(id) = id {
+            // The number may have passed to a kb started since: only the
+            // one with this id will do.
+            let status = UnixStream::connect(&socket)
+                .map_err(|_| gone(&id))
+                .and_then(|stream| exchange(stream, "status", json!({"listing": true})).map_err(|_| gone(&id)))?;
+            let mine = matches!(&status, Output::Text(text) if text.lines().any(|line| line == format!("id: {id}")));
+            if !mine {
+                return Err(gone(&id));
+            }
+        }
+        return UnixStream::connect(socket).map_err(|_| gone(&n.to_string()));
+    }
+    if let Some(session) = terminal_session() {
+        if let Some(stream) = connect_beside(&session)? {
             return Ok(stream);
         }
     }
@@ -240,157 +259,85 @@ fn connect() -> Result<UnixStream, String> {
     Err(NOT_RUNNING.to_owned())
 }
 
-/// Connect to the kb chosen, and if an id is given, only if it is still
-/// that run.
-fn connect_to(chosen: Chosen) -> Result<UnixStream, String> {
-    let gone = |name: &str| format!("kb {name} isn't running; kb list shows the ones that are");
-    let (n, id) = match chosen {
-        Chosen::Name(name) => {
-            return UnixStream::connect(named_socket(&name)?).map_err(|_| {
-                format!(
-                    "{}; start it with: kb --headless --name {name} [URL], or kb --name {name} in a pane",
-                    gone(&name)
-                )
-            });
-        }
-        Chosen::Number(n, id) => (n, id),
+/// The Rex session this process runs in: Rex sets REX_SESSION in each pane.
+fn terminal_session() -> Option<String> {
+    std::env::var("REX_SESSION").ok().filter(|session| !session.is_empty())
+}
+
+/// This kb's answer to `where`: its id, pane and session. None of it
+/// changes while kb runs, so the socket thread answers, and a page stuck in
+/// a script can't hold it up.
+fn whereabouts() -> String {
+    let env = |name: &str| std::env::var(name).unwrap_or_default();
+    // A headless kb is drawn nowhere, though it may have been started from
+    // a pane.
+    let (pane, session) = if crate::headless::running() {
+        (String::new(), String::new())
+    } else {
+        (env("REX_BLOCK"), env("REX_SESSION"))
     };
-    let socket = instance_socket(n)?;
-    if let Some(id) = id {
-        // The number may have passed to a kb started since: only the
-        // one with this id will do.
-        let status = UnixStream::connect(&socket)
-            .map_err(|_| gone(&id))
-            .and_then(|stream| exchange(stream, "status", json!({"listing": true})).map_err(|_| gone(&id)))?;
-        let mine = matches!(&status, Output::Text(text) if text.lines().any(|line| line == format!("id: {id}")));
-        if !mine {
-            return Err(gone(&id));
-        }
-    }
-    UnixStream::connect(socket).map_err(|_| gone(&n.to_string()))
+    format!("id: {}\npane: {pane}\nsession: {session}", id().unwrap_or_default())
 }
 
-/// Connect to the kb beside a caller in Rex, if there is one. An agent's
-/// commands then reach the kb it opened beside itself, not the user's own
-/// kb elsewhere, which may have the lowest number. With several beside
-/// it, guessing could drive the wrong one, so it fails and names them.
-fn connect_beside(caller: &Caller) -> Result<Option<UnixStream>, String> {
-    let kbs = listing();
-    // Only kbs drawn in a pane can be beside anyone, so Rex needn't be asked
-    // when there are none.
-    if kbs.iter().all(|kb| kb.pane.is_empty() || kb.id.is_empty()) {
-        return Ok(None);
-    }
-    let windows = crate::rex::windows(&caller.session);
-    match beside(caller, &kbs, windows.as_ref()) {
-        // The id names the run, so a kb started since in its place isn't
-        // reached; a named kb's id is its name.
-        Beside::One(id) => connect_to(choose(id)?).map(Some),
-        Beside::None => Ok(None),
-        Beside::Several(place, near) => {
-            let mut text = format!(
-                "{} kbs are open in your Rex {place}, so kb won't guess which you mean; name one with \
-                 kb ctl -i ID (for kb mcp serve, set KB_INSTANCE=ID):",
-                near.len()
-            );
-            for kb in near {
-                text.push_str(&format!("\n  {}\t{}\t{}", kb.id, kb.url, kb.pane));
-            }
-            Err(text)
-        }
-    }
+/// A running kb, as it answered `where`.
+struct Place {
+    socket: PathBuf,
+    id: String,
+    pane: String,
+    session: String,
 }
 
-/// A running kb, as its status describes it to kb list.
-pub struct Listed {
-    /// Its number, or the name it was started with.
-    pub which: String,
-    /// Empty while it isn't answering.
-    pub id: String,
-    /// "(not answering)" while it isn't.
-    pub url: String,
-    /// The Rex block (or other terminal's pane) it is drawn in, if any.
-    pub pane: String,
-    /// The Rex session that pane is in, if the kb said.
-    pub session: String,
-}
+/// How long to wait for a kb to say where it is. It answers at once unless
+/// its process is stopped.
+const WHERE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// The kbs running now, each as its status describes it.
-pub fn listing() -> Vec<Listed> {
+/// The running kbs that answer `where`. One too old to know it answers
+/// with an error, and is left out.
+fn places() -> Vec<Place> {
     running()
-        .into_iter()
-        .map(|which| {
-            let status = choose(&which)
-                .ok()
-                .and_then(|chosen| match chosen {
-                    Chosen::Name(name) => named_socket(&name).ok(),
-                    Chosen::Number(n, _) => instance_socket(n).ok(),
-                })
-                .and_then(|socket| UnixStream::connect(socket).ok())
-                .and_then(|stream| exchange(stream, "status", json!({"listing": true})).ok());
-            match status {
-                Some(Output::Text(status)) => listed(which, &status),
-                _ => Listed {
-                    which,
-                    id: String::new(),
-                    url: "(not answering)".to_owned(),
-                    pane: String::new(),
-                    session: String::new(),
-                },
-            }
+        .iter()
+        .filter_map(|which| {
+            let socket = match choose(which).ok()? {
+                Chosen::Name(name) => named_socket(&name).ok()?,
+                Chosen::Number(n, _) => instance_socket(n).ok()?,
+            };
+            let stream = UnixStream::connect(&socket).ok()?;
+            stream.set_read_timeout(Some(WHERE_TIMEOUT)).ok()?;
+            let Ok(Output::Text(text)) = exchange(stream, "where", json!({})) else { return None };
+            let field = |name: &str| text.lines().find_map(|line| line.strip_prefix(name)).unwrap_or("").to_owned();
+            Some(Place { socket, id: field("id: "), pane: field("pane: "), session: field("session: ") })
         })
         .collect()
 }
 
-/// Kb `which`, from the answer to its status.
-fn listed(which: String, status: &str) -> Listed {
-    let field = |name: &str| status.lines().find_map(|line| line.strip_prefix(name)).unwrap_or("").to_owned();
-    let url = field("url: ");
-    Listed {
-        which,
-        id: field("id: "),
-        url: if url.is_empty() { "about:blank".to_owned() } else { url },
-        pane: field("pane: "),
-        session: field("session: "),
+/// The kbs drawn in a pane of `session`.
+fn beside<'a>(session: &str, places: &'a [Place]) -> Vec<&'a Place> {
+    places.iter().filter(|place| !place.pane.is_empty() && place.session == session).collect()
+}
+
+/// Connect to the kb in the caller's terminal session, if there is one, so
+/// an agent reaches the kb it opened rather than the user's elsewhere.
+/// With several, a guess could drive the wrong one, so it fails.
+fn connect_beside(session: &str) -> Result<Option<UnixStream>, String> {
+    let places = places();
+    match beside(session, &places).as_slice() {
+        [] => Ok(None),
+        [place] => UnixStream::connect(&place.socket).map(Some).map_err(|_| NOT_RUNNING.to_owned()),
+        several => Err(several_beside(several)),
     }
 }
 
-/// Where the program asking for a kb is running in Rex.
-pub struct Caller {
-    pub session: String,
-    pub block: Option<String>,
-}
-
-/// Each block of the caller's Rex session, and the window it is in.
-pub type Windows = std::collections::HashMap<String, String>;
-
-/// Which kb a caller in Rex means when it names none.
-enum Beside<'a> {
-    /// That kb's id.
-    One(&'a str),
-    /// More than one in the same place: "window" or "session".
-    Several(&'static str, Vec<&'a Listed>),
-    None,
-}
-
-/// The kb in the caller's window, else in its session. `windows` is what
-/// Rex says of the session's blocks, if it could be asked.
-fn beside<'a>(caller: &Caller, kbs: &'a [Listed], windows: Option<&Windows>) -> Beside<'a> {
-    let window_of = |block: &str| windows.and_then(|windows| windows.get(block));
-    let callers_window = caller.block.as_deref().and_then(window_of);
-    let in_window: Vec<&Listed> =
-        kbs.iter().filter(|kb| callers_window.is_some() && window_of(&kb.pane) == callers_window).collect();
-    // Rex lists the session's blocks, and a kb says which session its own
-    // pane is in; either will do, so a kb is found without Rex answering.
-    let in_session = || -> Vec<&Listed> {
-        kbs.iter().filter(|kb| kb.session == caller.session || window_of(&kb.pane).is_some()).collect()
-    };
-    let (place, near) = if in_window.is_empty() { ("session", in_session()) } else { ("window", in_window) };
-    match near.as_slice() {
-        [] => Beside::None,
-        [kb] => Beside::One(&kb.id),
-        _ => Beside::Several(place, near),
+/// The failure for several kbs beside the caller, naming each.
+fn several_beside(several: &[&Place]) -> String {
+    let mut text = format!("{} kbs are open in your Rex session, so kb won't guess which you mean:", several.len());
+    for place in several {
+        text.push_str(&format!("\n  {}\t{}", place.id, place.pane));
     }
+    text.push_str(
+        "\nWith kb ctl, name yours: kb ctl -i ID. The MCP server can't name one per call: ask the user which kb \
+         to close, or to register the server for one kb with kb mcp serve -i NAME.",
+    );
+    text
 }
 
 /// The kbs running now, as `kb ctl -i` takes them: the numbered ones in
@@ -442,6 +389,10 @@ fn serve(mut stream: UnixStream, deliver: impl Fn(Request) -> bool) -> io::Resul
             Ok(mut request) => {
                 let (reply, answer) = mpsc::channel();
                 let command = request["command"].as_str().unwrap_or("").to_owned();
+                if command == "where" {
+                    writeln!(stream, "{}", json!({"ok": true, "text": whereabouts()}))?;
+                    continue;
+                }
                 let args = words(request["args"].take());
                 if !deliver(Request { command, args, reply }) {
                     return Ok(());
@@ -512,88 +463,39 @@ mod tests {
         assert!(bind(&long).unwrap_err().contains("longer than a Unix socket's path can be"));
     }
 
-    fn kb(number: u32, pane: &str, session: &str) -> Listed {
-        Listed {
-            which: number.to_string(),
-            id: format!("{number}-000{number}"),
-            url: format!("https://example.com/{number}"),
-            pane: pane.to_owned(),
-            session: session.to_owned(),
-        }
+    fn place(id: &str, pane: &str, session: &str) -> Place {
+        Place { socket: PathBuf::new(), id: id.to_owned(), pane: pane.to_owned(), session: session.to_owned() }
     }
 
-    fn caller(block: &str) -> Caller {
-        Caller { session: "session:s".to_owned(), block: Some(block.to_owned()) }
-    }
-
-    /// Block to window, as Rex lists the caller's session.
-    fn windows(pairs: &[(&str, &str)]) -> Windows {
-        pairs.iter().map(|(block, window)| (block.to_string(), window.to_string())).collect()
+    fn ids(places: Vec<&Place>) -> Vec<&str> {
+        places.iter().map(|place| place.id.as_str()).collect()
     }
 
     #[test]
-    fn the_kb_in_the_callers_window() {
+    fn the_kb_in_the_callers_session() {
         // The user's own kb is lowest-numbered, in another session.
-        let kbs = [kb(1, "block:mine", "session:other"), kb(2, "block:b", "session:s")];
-        let windows = windows(&[("block:agent", "window:w"), ("block:b", "window:w")]);
-        assert!(matches!(beside(&caller("block:agent"), &kbs, Some(&windows)), Beside::One("2-0002")));
+        let places = [place("1-0001", "block:mine", "session:other"), place("2-0002", "block:b", "session:s")];
+        assert_eq!(ids(beside("session:s", &places)), ["2-0002"]);
     }
 
     #[test]
-    fn else_the_kb_in_the_callers_session() {
-        let kbs = [kb(1, "block:mine", "session:other"), kb(2, "block:b", "")];
-        // Rex lists it in another window of the session; this kb didn't say
-        // which session it is in.
-        let windows = windows(&[("block:agent", "window:w"), ("block:b", "window:v")]);
-        assert!(matches!(beside(&caller("block:agent"), &kbs, Some(&windows)), Beside::One("2-0002")));
-    }
-
-    #[test]
-    fn without_rex_the_kb_that_says_it_is_in_the_session() {
-        let kbs = [kb(1, "block:mine", "session:other"), kb(2, "block:b", "session:s")];
-        assert!(matches!(beside(&caller("block:agent"), &kbs, None), Beside::One("2-0002")));
-    }
-
-    #[test]
-    fn several_beside_the_caller_are_not_guessed_between() {
-        let kbs = [kb(2, "block:b", "session:s"), kb(3, "block:c", "session:s"), kb(4, "block:d", "session:s")];
-        let windows = windows(&[("block:agent", "window:w"), ("block:b", "window:w"), ("block:c", "window:w")]);
-        let Beside::Several("window", near) = beside(&caller("block:agent"), &kbs, Some(&windows)) else { panic!() };
-        assert_eq!(near.iter().map(|kb| kb.which.as_str()).collect::<Vec<_>>(), ["2", "3"]);
-        // Without Rex, the windows can't be told apart.
-        let Beside::Several("session", near) = beside(&caller("block:agent"), &kbs, None) else { panic!() };
-        assert_eq!(near.len(), 3);
-    }
-
-    #[test]
-    fn the_window_wins_over_the_rest_of_the_session() {
-        let kbs = [kb(2, "block:b", "session:s"), kb(3, "block:c", "session:s")];
-        let windows = windows(&[("block:agent", "window:w"), ("block:b", "window:v"), ("block:c", "window:w")]);
-        assert!(matches!(beside(&caller("block:agent"), &kbs, Some(&windows)), Beside::One("3-0003")));
+    fn several_in_the_session_are_all_named() {
+        let places = [
+            place("2-0002", "block:b", "session:s"),
+            place("work", "block:c", "session:s"),
+            place("4-0004", "block:d", "session:other"),
+        ];
+        assert_eq!(ids(beside("session:s", &places)), ["2-0002", "work"]);
+        let text = several_beside(&beside("session:s", &places));
+        assert!(text.starts_with("2 kbs are open in your Rex session"));
+        assert!(text.contains("\n  work\tblock:c") && text.contains("kb mcp serve -i NAME"));
     }
 
     #[test]
     fn none_beside_the_caller() {
-        // Another session's, and a headless one started from the caller's pane.
-        let kbs = [kb(1, "block:mine", "session:other"), kb(2, "none (headless; it quits after 10 minutes)", "")];
-        let windows = windows(&[("block:agent", "window:w")]);
-        assert!(matches!(beside(&caller("block:agent"), &kbs, Some(&windows)), Beside::None));
-        assert!(matches!(beside(&caller("block:agent"), &kbs, None), Beside::None));
-        // A caller outside any block, as a program Rex started without one.
-        let nowhere = Caller { session: "session:s".to_owned(), block: None };
-        assert!(matches!(beside(&nowhere, &[kb(2, "block:b", "session:s")], Some(&windows)), Beside::One("2-0002")));
-    }
-
-    #[test]
-    fn a_status_read_for_kb_list() {
-        let kb = listed(
-            "2".to_owned(),
-            "url: http://127.0.0.1:8765/\ntitle: Test\nloading: no\nid: 2-9678\npane: block:b\nsession: session:s",
-        );
-        assert_eq!((kb.which.as_str(), kb.id.as_str(), kb.url.as_str()), ("2", "2-9678", "http://127.0.0.1:8765/"));
-        assert_eq!((kb.pane.as_str(), kb.session.as_str()), ("block:b", "session:s"));
-        // A blank page, from a kb outside Rex, or one too old to say its session.
-        let kb = listed("1".to_owned(), "url: \ntitle: \nid: 1-0001");
-        assert_eq!((kb.url.as_str(), kb.pane.as_str(), kb.session.as_str()), ("about:blank", "", ""));
+        // Another session's; a headless one, drawn nowhere; and one outside Rex.
+        let places =
+            [place("1-0001", "block:mine", "session:other"), place("posting", "", ""), place("3-0003", "", "")];
+        assert!(beside("session:s", &places).is_empty());
     }
 }

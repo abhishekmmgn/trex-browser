@@ -20,7 +20,8 @@ usage: kb mcp <on|off|status|serve [-i NAME]>
   serve   run the server on stdin/stdout; this is what an MCP client starts.
           With -i NAME (or a number or id) every tool drives that kb only,
           such as one started with kb --headless --name NAME; without it,
-          the lowest-numbered kb, usually the one in the user's pane";
+          the kb in the caller's Rex session, else the lowest-numbered kb,
+          usually the one in the user's pane";
 
 const OFF: &str = "kb's MCP server is off. Turn it on with: kb mcp on";
 
@@ -134,8 +135,9 @@ fn instructions() -> String {
              stay signed in. It may be headless, with nobody watching. Every tool acts on that kb only. It must \
              already be running (kb --headless --name {which} starts it)."
         ),
-        Err(_) => "Controls the kb browser running in the user's terminal pane. What these tools do happens on \
-                   the page the user is looking at. kb must already be running."
+        Err(_) => "Controls the kb browser running in the user's terminal pane: in Rex, the one in this Rex \
+                   session. What these tools do happens on the page the user is looking at. kb must already be \
+                   running."
             .to_owned(),
     }
 }

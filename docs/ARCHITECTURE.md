@@ -297,7 +297,7 @@ to it.
 `normalize_url` decides whether typed text is a URL, a bare host, a local
 file, or a search.
 
-## Agent tools (`control.rs`, `commands.rs`, `devtools.rs`, `cli.rs`, `mcp.rs`, `rex.rs`)
+## Agent tools (`control.rs`, `commands.rs`, `devtools.rs`, `cli.rs`, `mcp.rs`)
 
 ```
 kb ctl ──┐
@@ -332,18 +332,6 @@ number and four hex digits (`3-a7f2`). `kb ctl -i ID` asks that socket's kb
 for its id before sending the command, and fails if it differs: an agent
 holding an old id is told its kb has gone rather than driving another.
 
-"Beside" a caller in Rex means a kb whose pane (its `REX_BLOCK`) is in the
-caller's Rex window, else in its session. An agent's `kb ctl` and `kb mcp
-serve` run in its own pane, so they reach the kb it split beside itself,
-not the user's kb in another session that happens to be number 1. Rex
-moves blocks between windows, so `rex.rs` asks Rex each time, with `rex
-block ls --json` (found through the panes' `REX_BIN_DIR`, else PATH), which
-lists the session's blocks and their windows. If Rex can't be asked in two
-seconds, or isn't installed, each kb's own `REX_SESSION`, which its status
-reports to listings only, still finds the ones in the session. With several
-in the same place, the client fails and lists them rather than guess; with
-none, it goes on to the lowest-numbered, as outside Rex.
-
 `control.rs` gives each running kb a number, the lowest not in use, and a
 socket to match: `~/.kittybrowser/kb.sock` for the first, `kb-2.sock` and so
 on after it (mode 0600). The number is taken before anything is written to
@@ -353,11 +341,17 @@ same one. A kb started with `--name NAME` takes no number: its socket is
 its name is its id. Names start with a letter, so they can't be mistaken
 for numbers or ids. As a kb quits it removes its socket at once, before
 Chrome has closed, so the same name can start again straight away; and only
-if the socket is still its own, by inode. Clients go to the kb that `kb ctl -i N|ID|NAME` or `KB_INSTANCE` names;
-else, run in Rex (`REX_SESSION` is set), to the kb beside them; else to the
-lowest-numbered. Each client gets a thread that turns a request
-line into a `Request` carrying a reply channel, hands it to the app loop, and
-writes back whatever arrives.
+if the socket is still its own, by inode. Clients go to the kb that `kb ctl
+-i N|ID|NAME` or `KB_INSTANCE` names; else, run in Rex, to the kb beside
+them; else to the lowest-numbered. Each client gets a thread that turns a
+request line into a `Request` carrying a reply channel, hands it to the app
+loop, and writes back whatever arrives.
+
+"Beside" means drawn in a pane with the caller's `REX_SESSION`, so an
+agent reaches the kb it split, not the user's kb in another session. The
+client asks each kb `where` (id, pane, session); the socket's thread
+answers, not the app, so a page stuck in a script can't stall other kbs'
+commands. Several kbs there is an error that lists them.
 
 `devtools.rs` carries commands out on the app thread, which never blocks on
 Chrome. A command that needs an answer parks its reply channel in `pending`
