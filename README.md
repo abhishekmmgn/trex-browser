@@ -238,7 +238,11 @@ one:
 Selectors are CSS (reaching into shadow DOM), `text=Some words`, `@N` from
 `kb ctl links`, or `:focus`. With several kbs running, pick one with
 `kb ctl -i N` (its number in `kb list`) or `-i ID` (its id, such as `3-a7f2`,
-which unlike the number isn't reused by a kb started later).
+which unlike the number isn't reused by a kb started later). Without one,
+in Rex, `kb ctl` and the MCP server go to the kb in the caller's window,
+else its session, so an agent reaches the kb it opened beside itself rather
+than yours elsewhere; with several there they fail and list them. Outside
+Rex, or with none there, they go to the lowest-numbered kb.
 
 The same commands are available as an MCP server, which is off until you turn
 it on: `kb mcp on` (it prints how to register it with Claude Code), `kb mcp
@@ -259,12 +263,15 @@ it's worth knowing before you turn on the MCP server. See
 | `--devtools` | Serve Chrome DevTools on a port of 127.0.0.1, for F12 (any program on this machine can then reach the browser) |
 | `~/.kittybrowser/keys` | Key bindings; `kb keys` shows the format and what's bound |
 | `KB_CHROME` | The browser to run, if kb doesn't find one |
+| `KB_SLOW_SCROLL` | Set to `1` to split repeated slow vertical wheel ticks into two updates. The second half follows up to 33 ms later. |
+| `KB_FRAME_FORMAT` | Set to `jpeg` (quality 90) or `jpeg95` (quality 95) to try lossy frames in a local pane that accepts files. The default is PNG. |
 | `KB_CHROME_ARGS` | Extra flags for Chrome, separated by spaces |
 | `KB_TRANSFER=pty` | Always send frames through the terminal, never by file |
 | `KB_TRANSFER=png` | Through the terminal, and each frame whole as a PNG: for a terminal that shows kb's page broken over ssh |
 | `KB_FORCE` | Start without asking the terminal whether it draws kitty graphics |
 | `KB_HEADLESS_IDLE` | Seconds a headless kb (`kb --headless`) waits for a command before quitting by itself; default 600 |
 | `KB_LOG` | A file to append diagnostics to (sizes, frames, clicks) |
+| `KB_TRACE_SCROLL` | A file to append a timed log of scrolling to: each wheel report, what went to Chrome, each frame's way to the screen. With it, `KB_TRACE_FRAMES` is a folder to keep every frame in |
 
 ## Troubleshooting
 

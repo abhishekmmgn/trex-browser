@@ -8,6 +8,7 @@ use crate::devtools::{Devtools, Page};
 use crate::engine::chrome::{self, Chrome, PageEvent};
 use crate::history::History;
 use crate::keys::{Action, Bindings};
+use crate::scroll::AxisLock;
 use crate::term::input::{Button, Event, Key, KeyCode, Mouse, MouseKind, Parser};
 use crate::term::page::{PageImage, Route};
 use crate::term::size::{self, Window};
@@ -152,8 +153,6 @@ enum Msg {
 
 /// How often to check whether the pane changed size.
 const TICK: Duration = Duration::from_millis(100);
-/// CSS pixels scrolled per wheel tick.
-const WHEEL_STEP: f64 = 60.0;
 /// Presses this close in time and place count as a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// How long after the last key, click or command the page counts as in use.
@@ -178,8 +177,40 @@ fn log(line: std::fmt::Arguments) {
     }
 }
 
+/// Trace what the terminal sent: each mouse report as it came (the wheel's
+/// button code is 64 up, 65 down, 66 left, 67 right, plus 4 Shift, 8 Alt and
+/// 16 Ctrl), and the answers to the status query sent after each frame.
+fn trace_input(bytes: &[u8]) {
+    let text = String::from_utf8_lossy(bytes);
+    let mut reports = Vec::new();
+    for part in text.split('\x1b').skip(1) {
+        if let Some(report) = part.strip_prefix("[<") {
+            let end = report.find(['M', 'm']).map_or(report.len(), |end| end + 1);
+            reports.push(&report[..end]);
+        } else if part.starts_with("[0n") {
+            crate::trace::line(format_args!("terminal took the frame"));
+        }
+    }
+    if !reports.is_empty() {
+        crate::trace::line(format_args!("in {}B: {}", bytes.len(), reports.join(" ")));
+    }
+}
+
+/// How far one wheel tick scrolls the page, in CSS pixels across and down:
+/// one column or one row of the pane it is shown in. Terminals report a
+/// trackpad by sending a tick each time the fingers move a row's height (a
+/// column's width across), and a mouse wheel as a few rows a notch, so this
+/// keeps the page under the fingers and moves it as far as the terminal's
+/// own scrollback would. `viewport` is in CSS pixels and `shown` in cells.
+fn wheel_step(viewport: (u32, u32), shown: (u16, u16)) -> (f64, f64) {
+    (viewport.0 as f64 / shown.0.max(1) as f64, viewport.1 as f64 / shown.1.max(1) as f64)
+}
+
 struct App {
     chrome: Chrome,
+    /// Keeps a trackpad swipe to the direction it mostly goes.
+    axis_lock: AxisLock,
+    slow_wheel: Option<crate::scroll::SlowWheel>,
     scale: f64,
     window: Window,
     /// Cell size from a terminal query or Rex, for terminals whose window
@@ -205,6 +236,9 @@ struct App {
     loading: bool,
     /// The newest frame, kept to redraw at a new size.
     frame: Option<String>,
+    jpeg_pixels: Option<graphics::Pixels>,
+    last_jpeg: Option<String>,
+    jpeg_cast: bool,
     /// Whether the terminal reads frames from temporary files.
     by_file: bool,
     /// The page's image on the screen.
@@ -320,6 +354,9 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         loop {
             match stdin.read(&mut buf) {
                 Ok(n) if n > 0 => {
+                    if crate::trace::on() {
+                        trace_input(&buf[..n]);
+                    }
                     for event in parser.feed(&buf[..n]) {
                         if input.send(Msg::Term(event)).is_err() {
                             return;
@@ -361,6 +398,9 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         url: String::new(),
         loading: false,
         frame: None,
+        jpeg_pixels: None,
+        last_jpeg: None,
+        jpeg_cast: false,
         by_file: false,
         page: Default::default(),
         png_only: false,
@@ -390,6 +430,8 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         panel: None,
         asking_quit: false,
         quit_clicked: false,
+        axis_lock: AxisLock::default(),
+        slow_wheel: (std::env::var("KB_SLOW_SCROLL").as_deref() == Ok("1")).then(Default::default),
     };
     if let Some(dark) = options.dark {
         app.chrome.color_scheme(Some(dark));
@@ -422,6 +464,9 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
             true => app.frame_gap().saturating_sub(app.last_ack.elapsed()).min(TICK),
             false => TICK,
         };
+        if let Some((due, ..)) = app.slow_wheel.as_ref().and_then(|wheel| wheel.pending) {
+            wait = wait.min(due.saturating_duration_since(Instant::now()));
+        }
         if let Some(splash_wait) = app.splash.as_ref().filter(|_| app.by_file).and_then(|splash| splash.wait()) {
             wait = wait.min(splash_wait);
         }
@@ -431,6 +476,9 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
             Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
         messages.extend(rx.try_iter());
+        if app.slow_wheel.as_ref().and_then(|wheel| wheel.pending).is_some_and(|(due, ..)| due <= Instant::now()) {
+            app.finish_wheel();
+        }
 
         let (mut new_frame, mut redraw) = (false, false);
         let mut quit = None;
@@ -442,8 +490,32 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         }
         let mut messages = messages.into_iter().enumerate().peekable();
         while let Some((index, message)) = messages.next() {
+            if matches!(
+                &message,
+                Msg::Term(Event::Key(_) | Event::Mouse(_) | Event::Paste(_) | Event::Focus(_) | Event::CellSize { .. })
+                    | Msg::Control(_)
+            ) {
+                app.finish_wheel();
+                if !matches!(&message, Msg::Term(Event::Mouse(Mouse { kind: MouseKind::Wheel(..), .. }))) {
+                    if let Some(wheel) = &mut app.slow_wheel {
+                        *wheel = Default::default();
+                    }
+                }
+            }
             match message {
-                Msg::Term(Event::Mouse(mouse)) => {
+                Msg::Term(Event::Mouse(mut mouse)) => {
+                    // A burst of wheel ticks scrolls once, by all of them,
+                    // rather than sending Chrome a scroll for each row.
+                    let mut merged = 1;
+                    while let Some((_, Msg::Term(Event::Mouse(next)))) = messages.peek() {
+                        let Some(sum) = mouse.add_wheel(next) else { break };
+                        mouse = sum;
+                        merged += 1;
+                        messages.next();
+                    }
+                    if let MouseKind::Wheel(dx, dy) = mouse.kind {
+                        crate::trace::scroll!("merge ticks {dx},{dy} from {merged} reports");
+                    }
                     // A burst of moves collapses to the last one.
                     let next_is_move = matches!(
                         messages.peek(),
@@ -522,6 +594,20 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                     }
                     if id == graphics::FILE_QUERY_ID {
                         app.by_file = ok;
+                        if ok && !app.jpeg_cast {
+                            let quality = match std::env::var("KB_FRAME_FORMAT").as_deref() {
+                                Ok("jpeg") => Some(90),
+                                Ok("jpeg95") => Some(95),
+                                _ => None,
+                            };
+                            if let Some(quality) = quality {
+                                app.chrome.stop_screencast();
+                                app.chrome.start_screencast_jpeg(quality);
+                                app.jpeg_cast = true;
+                            }
+                        } else if !ok && app.jpeg_cast {
+                            app.resume_png();
+                        }
                         // If it said no, it didn't delete the file either.
                         let _ = std::fs::remove_file(graphics::temp_path(0));
                     }
@@ -578,10 +664,41 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                     if !app.chrome.shown(&message) {
                         continue;
                     }
+                    if matches!(
+                        message["method"].as_str(),
+                        Some("Page.frameNavigated" | "Page.navigatedWithinDocument" | "Target.targetDestroyed")
+                    ) {
+                        if let Some(wheel) = &mut app.slow_wheel {
+                            *wheel = Default::default();
+                        }
+                    }
                     app.devtools.observe(&message, &mut app.chrome);
                     match app.chrome.handle(message) {
                         Some(PageEvent::Frame(png)) => {
+                            if png.starts_with("/9j/") {
+                                if app.jpeg_cast && app.last_jpeg.as_deref() != Some(&png) {
+                                    let pixels =
+                                        crate::base64::decode(&png).and_then(|bytes| graphics::decode_jpeg(&bytes));
+                                    match pixels {
+                                        Some(pixels) if app.fits_size(pixels.width, pixels.height) => {
+                                            app.last_jpeg = Some(png);
+                                            app.jpeg_pixels = Some(pixels);
+                                            app.frame = None;
+                                            new_frame = app.splash.is_none() || app.committed;
+                                        }
+                                        // Drop late frames from the previous viewport, as for PNG.
+                                        Some(_) => {}
+                                        None => app.resume_png(),
+                                    }
+                                }
+                                continue;
+                            }
                             let fits = app.fits(&png);
+                            crate::trace::scroll!(
+                                "frame-use fits={fits} same={} splash={}",
+                                app.frame.as_deref() == Some(png.as_str()),
+                                app.splash.is_some() && !app.committed
+                            );
                             log(format_args!(
                                 "frame {:?}, {} bytes, fits: {fits}",
                                 graphics::png_size(&png),
@@ -593,6 +710,8 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                             // Some pages repaint without changing: the same
                             // frame again is nothing to draw.
                             if fits && app.frame.as_deref() != Some(png.as_str()) {
+                                app.last_jpeg = None;
+                                app.jpeg_pixels = None;
                                 app.frame = Some(png);
                                 // The blank page that comes first stays under the logo.
                                 new_frame = app.splash.is_none() || app.committed;
@@ -668,6 +787,7 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         }
         // One frame per gap, or all of them while the page is in use.
         while app.chrome.ack_pending() && app.last_ack.elapsed() >= app.frame_gap() {
+            crate::trace::scroll!("ack gap={:?}", app.frame_gap());
             app.chrome.ack();
             if !app.frame_gap().is_zero() {
                 app.last_ack = Instant::now();
@@ -756,6 +876,10 @@ impl App {
             self.window, self.reported_cell, self.shown
         ));
         self.viewport = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
+        if self.jpeg_pixels.as_ref().is_some_and(|p| !self.fits_size(p.width, p.height)) {
+            self.last_jpeg = None;
+            self.jpeg_pixels = None;
+        }
         if self.frame.as_deref().is_some_and(|png| !self.fits(png)) {
             self.frame = None;
         }
@@ -1014,6 +1138,10 @@ impl App {
     /// give or take rounding.
     fn fits(&self, png: &str) -> bool {
         let Some((width, height)) = graphics::png_size(png) else { return false };
+        self.fits_size(width, height)
+    }
+
+    fn fits_size(&self, width: u32, height: u32) -> bool {
         let close = |actual: u32, css: u32| {
             // Chrome renders at its launch scale whatever the zoom: zoomed
             // in, the frame has fewer pixels than the cells and is stretched
@@ -1022,6 +1150,14 @@ impl App {
             (actual as f64 - expected).abs() <= (expected / 100.0).max(2.0)
         };
         close(width, self.viewport.0) && close(height, self.viewport.1)
+    }
+
+    fn resume_png(&mut self) {
+        self.jpeg_cast = false;
+        self.last_jpeg = None;
+        self.jpeg_pixels = None;
+        self.chrome.stop_screencast();
+        self.chrome.start_screencast();
     }
 
     fn navigate(&mut self, url: &str) {
@@ -1034,10 +1170,19 @@ impl App {
     fn draw(&mut self, frame: bool) {
         // Synchronized update, so the terminal shows the result in one go.
         let mut out = b"\x1b[?2026h".to_vec();
+        let mut traced_frame = false;
         let cell = self.cell();
         let frame = frame && (self.splash.is_none() || self.committed);
         if frame && self.splash.take().is_some() {
             crate::splash::Splash::remove(&mut out, 2);
+        }
+        if let Some(pixels) = self.jpeg_pixels.as_ref().filter(|_| frame) {
+            if self.page.draw_pixels(&mut out, pixels, self.shown) {
+                traced_frame = true;
+                crate::trace::scroll!("draw JPEG by file");
+            } else {
+                self.resume_png();
+            }
         }
         if let Some(png) = self.frame.as_deref().filter(|_| frame) {
             let (cols, rows) = self.shown;
@@ -1047,8 +1192,15 @@ impl App {
                 (false, false) => Route::Layers,
                 (false, true) => Route::Png,
             };
+            let started = crate::trace::now();
             let drawn = self.page.draw(&mut out, png, route, scaled, cols, rows, cell, 2);
             log(format_args!("drew {drawn}"));
+            crate::trace::scroll!(
+                "draw {route:?} {drawn} prepare={:.1}ms out={}B",
+                crate::trace::now() - started,
+                out.len()
+            );
+            traced_frame = true;
         }
         let cols = self.window.cols as usize;
         let mut badge = String::new();
@@ -1080,7 +1232,16 @@ impl App {
         }
         self.render_help(&mut out);
         out.extend_from_slice(b"\x1b[?2026l");
+        if traced_frame {
+            // The terminal answers this status query once it has taken
+            // in everything before it: the frame's arrival, traced.
+            out.extend_from_slice(b"\x1b[5n");
+        }
+        let started = crate::trace::now();
         term::write(&out);
+        if traced_frame {
+            crate::trace::scroll!("written {}B in {:.1}ms", out.len(), crate::trace::now() - started);
+        }
     }
 
     /// Open the find field in the address bar's place.
@@ -1317,6 +1478,12 @@ impl App {
         Ok(Output::Text(said))
     }
 
+    fn finish_wheel(&mut self) {
+        if let Some((_, x, y, down)) = self.slow_wheel.as_mut().and_then(|wheel| wheel.pending.take()) {
+            self.chrome.wheel(x, y, 0.0, down, 0);
+        }
+    }
+
     /// Returns whether the top bar needs redrawing.
     fn on_mouse(&mut self, mouse: Mouse) -> bool {
         // A click closes the help, and does nothing else.
@@ -1470,9 +1637,47 @@ impl App {
                 }
             }
             MouseKind::Wheel(dx, dy) => {
-                self.chrome.wheel(x, y, dx as f64 * WHEEL_STEP, dy as f64 * WHEEL_STEP, modifiers)
+                let (step_x, step_y) = wheel_step(self.viewport, self.shown);
+                // With a key held the wheel may zoom, or scroll across on
+                // purpose, so only a plain swipe is kept to one axis.
+                let (dx, dy) = match modifiers {
+                    0 => self.axis_lock.filter(Instant::now(), dx, dy),
+                    _ => (dx, dy),
+                };
+                let (across, down) = (dx as f64 * step_x, dy as f64 * step_y);
+                crate::trace::scroll!(
+                    "send wheel deltaX={across:.1} deltaY={down:.1} at {x:.0},{y:.0} modifiers={modifiers}"
+                );
+                if (across, down) != (0.0, 0.0) {
+                    let down = match &mut self.slow_wheel {
+                        Some(wheel) if modifiers == 0 && dx == 0 && dy.unsigned_abs() == 1 => {
+                            wheel.vertical(Instant::now(), x, y, dy, down)
+                        }
+                        Some(wheel) => {
+                            *wheel = Default::default();
+                            down
+                        }
+                        None => down,
+                    };
+                    self.chrome.wheel(x, y, across, down, modifiers);
+                }
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wheel_tick_scrolls_the_page_one_row_of_the_pane() {
+        // A Retina pane of 100x40 cells of 16x34 pixels, at 2 pixels per
+        // CSS pixel: a row is 17 CSS pixels tall and a column 8 wide.
+        assert_eq!(wheel_step((800, 680), (100, 40)), (8.0, 17.0));
+        // Zoomed to 200%, the same pane holds half as much page, so a row
+        // moves the page half as far and keeps up with the fingers.
+        assert_eq!(wheel_step((400, 340), (100, 40)), (4.0, 8.5));
     }
 }

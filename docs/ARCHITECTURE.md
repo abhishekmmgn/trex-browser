@@ -18,9 +18,10 @@ channel, and is the only one that writes to the terminal or to Chrome. It
 draws only when something changed. There is no async runtime.
 
 Each pass of the loop drains everything waiting on the channel. If several
-frames arrived, only the newest is drawn, and a burst of mouse moves collapses
-to the last one. Writing a frame to the terminal blocks until the terminal has
-taken it, which is what keeps a slow terminal from falling behind.
+frames arrived, only the newest is drawn, a burst of mouse moves collapses
+to the last one, and a burst of wheel ticks to one scroll by all of them.
+Writing a frame to the terminal blocks until the terminal has taken it, which
+is what keeps a slow terminal from falling behind.
 
 ## Startup
 
@@ -247,6 +248,27 @@ pastes (bracketed paste) and replies to queries. Mouse reporting is SGR
 requested and then confirmed with a mode query; without confirmation, reports
 are taken as cells and mapped to the cell's centre. Rex confirms pixel mode.
 
+A wheel report carries no distance, only a direction. Terminals turn a
+trackpad's movement into one report per row the fingers move (per column
+across), and a mouse wheel's notch into a few (three by default in Ghostty,
+five in kitty). So each tick scrolls the page by one row of the pane,
+in CSS pixels for the zoom and fit in effect: the page stays under the
+fingers, and a notch moves it as far as the terminal's own scrollback would.
+
+Fingers swiping up or down drift sideways, and the terminal reports that as
+ticks across mixed in (Rex sent one left for every two or three up). Pages
+with a sideways-scrolling row of cards then shift it, and it snaps back. So
+a swipe keeps to one axis, as in browsers (`scroll::AxisLock`): its first
+tick's, until the latest dozen ticks go the other way at least twice as
+often, and a pause of a quarter second starts a new swipe. A wheel with a key held goes
+as it comes.
+
+Chrome on macOS stretches the page past its ends and springs it back
+(elastic overscroll) for these wheel events, which with no fingers on glass
+looks like the page shifting at the top, the bottom, and sideways. A style
+sheet adopted into each document sets `overscroll-behavior: none` on the
+root, which turns that off and does nothing else there.
+
 The kitty keyboard protocol's first level is switched on, so in terminals
 that have it Esc, and keys held with Ctrl, Alt or Command, arrive as
 `CSI code ; modifiers u` and can't be mistaken for anything else. That is
@@ -283,7 +305,7 @@ to it.
 `normalize_url` decides whether typed text is a URL, a bare host, a local
 file, or a search.
 
-## Agent tools (`control.rs`, `commands.rs`, `devtools.rs`, `cli.rs`, `mcp.rs`)
+## Agent tools (`control.rs`, `commands.rs`, `devtools.rs`, `cli.rs`, `mcp.rs`, `rex.rs`)
 
 ```
 kb ctl ──┐
@@ -310,12 +332,25 @@ number and four hex digits (`3-a7f2`). `kb ctl -i ID` asks that socket's kb
 for its id before sending the command, and fails if it differs: an agent
 holding an old id is told its kb has gone rather than driving another.
 
+"Beside" a caller in Rex means a kb whose pane (its `REX_BLOCK`) is in the
+caller's Rex window, else in its session. An agent's `kb ctl` and `kb mcp
+serve` run in its own pane, so they reach the kb it split beside itself,
+not the user's kb in another session that happens to be number 1. Rex
+moves blocks between windows, so `rex.rs` asks Rex each time, with `rex
+block ls --json` (found through the panes' `REX_BIN_DIR`, else PATH), which
+lists the session's blocks and their windows. If Rex can't be asked in two
+seconds, or isn't installed, each kb's own `REX_SESSION`, which its status
+reports to listings only, still finds the ones in the session. With several
+in the same place, the client fails and lists them rather than guess; with
+none, it goes on to the lowest-numbered, as outside Rex.
+
 `control.rs` gives each running kb a number, the lowest not in use, and a
 socket to match: `~/.kittybrowser/kb.sock` for the first, `kb-2.sock` and so
 on after it (mode 0600). The number is taken before anything is written to
 the terminal, under a file lock so two kbs starting together can't take the
-same one. Clients go to the lowest-numbered kb unless `kb ctl -i N` or
-`KB_INSTANCE` names another. Each client gets a thread that turns a request
+same one. Clients go to the kb that `kb ctl -i N` or `KB_INSTANCE` names;
+else, run in Rex (`REX_SESSION` is set), to the kb beside them; else to the
+lowest-numbered. Each client gets a thread that turns a request
 line into a `Request` carrying a reply channel, hands it to the app loop, and
 writes back whatever arrives.
 

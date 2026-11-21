@@ -16,9 +16,12 @@ mod headless;
 mod history;
 mod keys;
 mod mcp;
+mod rex;
+mod scroll;
 mod skill;
 mod splash;
 mod term;
+mod trace;
 mod ui;
 
 const USAGE: &str = "\

@@ -33,12 +33,15 @@ src/splash.rs          the logo shown until the first page (assets/logo.svg)
 src/engine/cdp.rs      DevTools protocol over Chrome's debugging pipe
 src/engine/chrome.rs   starts Chrome; commands to the page, events from it
 src/term/              raw mode, input decoding, pane size, kitty graphics
+src/scroll.rs          keeps a trackpad swipe to one axis
+src/trace.rs           KB_TRACE_SCROLL, the timed log of scrolling
 src/control.rs         the socket that kb ctl and the MCP server talk to; instances
 src/commands.rs        the agent commands: one table drives kb ctl, its help and MCP
 src/devtools.rs        carries the agent commands out, and the page-side scripts
 src/cli.rs             kb ctl and kb list
 src/doctor.rs          kb doctor, and what kb says in a terminal it can't draw in
 src/mcp.rs             kb mcp
+src/rex.rs             asks Rex which window each pane is in, so kb ctl finds the kb beside it
 src/skill.rs           kb skill; the skill's text is skill/SKILL.md
 src/bench.rs           kb bench
 src/headless.rs        kb --headless: the browser without a pane, for kb ctl alone
