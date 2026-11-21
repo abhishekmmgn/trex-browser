@@ -265,6 +265,7 @@ it's worth knowing before you turn on the MCP server. See
 | `KB_FORCE` | Start without asking the terminal whether it draws kitty graphics |
 | `KB_HEADLESS_IDLE` | Seconds a headless kb (`kb --headless`) waits for a command before quitting by itself; default 600 |
 | `KB_LOG` | A file to append diagnostics to (sizes, frames, clicks) |
+| `KB_TRACE_SCROLL` | A file to append a timed log of scrolling to: each wheel report, what went to Chrome, each frame's way to the screen. With it, `KB_TRACE_FRAMES` is a folder to keep every frame in |
 
 ## Troubleshooting
 

@@ -33,6 +33,8 @@ src/splash.rs          the logo shown until the first page (assets/logo.svg)
 src/engine/cdp.rs      DevTools protocol over Chrome's debugging pipe
 src/engine/chrome.rs   starts Chrome; commands to the page, events from it
 src/term/              raw mode, input decoding, pane size, kitty graphics
+src/scroll.rs          keeps a trackpad swipe to one axis
+src/trace.rs           KB_TRACE_SCROLL, the timed log of scrolling
 src/control.rs         the socket that kb ctl and the MCP server talk to; instances
 src/commands.rs        the agent commands: one table drives kb ctl, its help and MCP
 src/devtools.rs        carries the agent commands out, and the page-side scripts

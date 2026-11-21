@@ -11,6 +11,11 @@ Notable changes to kb. The format follows
   trackpad several times too fast. A mouse wheel moves as many rows a notch
   as the terminal's own scrollback, and a burst of ticks reaches the page
   as one scroll.
+- A trackpad swipe up or down no longer nudges the page sideways: the ticks
+  across that a terminal mixes in as the fingers drift are dropped unless
+  the swipe mostly goes across, so rows of cards stay put. And the page no
+  longer stretches and springs back at its ends (Chrome's elastic overscroll
+  on macOS). `KB_TRACE_SCROLL` logs scrolling, timed, for diagnosing it.
 - `kb --headless URL` runs kb in the background without a pane, driven by
   `kb ctl` alone, with the same profile and commands. It prints its number,
   `kb ctl -i N quit` stops it (and quits any kb), and it stops by itself
