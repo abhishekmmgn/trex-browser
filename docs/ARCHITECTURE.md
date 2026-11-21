@@ -18,9 +18,10 @@ channel, and is the only one that writes to the terminal or to Chrome. It
 draws only when something changed. There is no async runtime.
 
 Each pass of the loop drains everything waiting on the channel. If several
-frames arrived, only the newest is drawn, and a burst of mouse moves collapses
-to the last one. Writing a frame to the terminal blocks until the terminal has
-taken it, which is what keeps a slow terminal from falling behind.
+frames arrived, only the newest is drawn, a burst of mouse moves collapses
+to the last one, and a burst of wheel ticks to one scroll by all of them.
+Writing a frame to the terminal blocks until the terminal has taken it, which
+is what keeps a slow terminal from falling behind.
 
 ## Startup
 
@@ -246,6 +247,13 @@ pastes (bracketed paste) and replies to queries. Mouse reporting is SGR
 (mode 1006) with any-motion tracking. Pixel coordinates (mode 1016) are
 requested and then confirmed with a mode query; without confirmation, reports
 are taken as cells and mapped to the cell's centre. Rex confirms pixel mode.
+
+A wheel report carries no distance, only a direction. Terminals turn a
+trackpad's movement into one report per row the fingers move (per column
+across), and a mouse wheel's notch into a few (three by default in Ghostty,
+five in kitty). So each tick scrolls the page by one row of the pane,
+in CSS pixels for the zoom and fit in effect: the page stays under the
+fingers, and a notch moves it as far as the terminal's own scrollback would.
 
 The kitty keyboard protocol's first level is switched on, so in terminals
 that have it Esc, and keys held with Ctrl, Alt or Command, arrive as

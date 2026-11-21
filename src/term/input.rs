@@ -78,6 +78,20 @@ pub struct Mouse {
     pub shift: bool,
 }
 
+impl Mouse {
+    /// This wheel report and the `next` one as one, if they are ticks of the
+    /// same scroll: both wheel, in the same cell, with the same keys held.
+    /// A trackpad sends a tick for every row the fingers move, so a quick
+    /// swipe arrives as a burst, which can reach the page as one scroll.
+    pub fn add_wheel(&self, next: &Mouse) -> Option<Mouse> {
+        let (MouseKind::Wheel(x, y), MouseKind::Wheel(next_x, next_y)) = (self.kind, next.kind) else {
+            return None;
+        };
+        let same = |mouse: &Mouse| (mouse.x, mouse.y, mouse.ctrl, mouse.alt, mouse.shift);
+        (same(self) == same(next)).then_some(Mouse { kind: MouseKind::Wheel(x + next_x, y + next_y), ..*self })
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Event {
     Key(Key),
@@ -451,6 +465,34 @@ mod tests {
             [Event::Mouse(Mouse { kind: MouseKind::Wheel(0, 1), button: None, ..base })]
         );
         assert_eq!(parse(b"\x1b[<18;12;3M"), [Event::Mouse(Mouse { button: Some(Button::Right), ctrl: true, ..base })]);
+    }
+
+    #[test]
+    fn a_burst_of_wheel_ticks_adds_up() {
+        let mouse = |bytes: &[u8]| match parse(bytes)[..] {
+            [Event::Mouse(mouse)] => mouse,
+            ref other => panic!("not one mouse report: {other:?}"),
+        };
+        // One notch of a mouse wheel, as Ghostty sends it: three rows down.
+        let notch = parse(b"\x1b[<65;12;3M\x1b[<65;12;3M\x1b[<65;12;3M");
+        let mut events = notch.iter().map(|event| match event {
+            Event::Mouse(mouse) => *mouse,
+            other => panic!("not a mouse report: {other:?}"),
+        });
+        let first = events.next().unwrap();
+        let sum = events.try_fold(first, |sum, next| sum.add_wheel(&next)).unwrap();
+        assert_eq!(sum, Mouse { kind: MouseKind::Wheel(0, 3), ..first });
+        // Up and down cancel out, and across adds to across.
+        let down_right = mouse(b"\x1b[<65;12;3M").add_wheel(&mouse(b"\x1b[<67;12;3M")).unwrap();
+        assert_eq!(down_right.kind, MouseKind::Wheel(1, 1));
+        assert_eq!(down_right.add_wheel(&mouse(b"\x1b[<64;12;3M")).unwrap().kind, MouseKind::Wheel(1, 0));
+        // Not one scroll: the mouse moved to another cell, a key is held
+        // that only some ticks have, or it isn't a wheel at all.
+        let down = mouse(b"\x1b[<65;12;3M");
+        assert_eq!(down.add_wheel(&mouse(b"\x1b[<65;13;3M")), None);
+        assert_eq!(down.add_wheel(&mouse(b"\x1b[<69;12;3M")), None);
+        assert_eq!(down.add_wheel(&mouse(b"\x1b[<0;12;3M")), None);
+        assert_eq!(mouse(b"\x1b[<0;12;3M").add_wheel(&down), None);
     }
 
     #[test]

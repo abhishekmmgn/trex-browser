@@ -152,8 +152,6 @@ enum Msg {
 
 /// How often to check whether the pane changed size.
 const TICK: Duration = Duration::from_millis(100);
-/// CSS pixels scrolled per wheel tick.
-const WHEEL_STEP: f64 = 60.0;
 /// Presses this close in time and place count as a double click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// How long after the last key, click or command the page counts as in use.
@@ -176,6 +174,16 @@ fn log(line: std::fmt::Arguments) {
     if let Some(file) = file {
         let _ = writeln!(file.lock().unwrap(), "{line}");
     }
+}
+
+/// How far one wheel tick scrolls the page, in CSS pixels across and down:
+/// one column or one row of the pane it is shown in. Terminals report a
+/// trackpad by sending a tick each time the fingers move a row's height (a
+/// column's width across), and a mouse wheel as a few rows a notch, so this
+/// keeps the page under the fingers and moves it as far as the terminal's
+/// own scrollback would. `viewport` is in CSS pixels and `shown` in cells.
+fn wheel_step(viewport: (u32, u32), shown: (u16, u16)) -> (f64, f64) {
+    (viewport.0 as f64 / shown.0.max(1) as f64, viewport.1 as f64 / shown.1.max(1) as f64)
 }
 
 struct App {
@@ -443,7 +451,14 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         let mut messages = messages.into_iter().enumerate().peekable();
         while let Some((index, message)) = messages.next() {
             match message {
-                Msg::Term(Event::Mouse(mouse)) => {
+                Msg::Term(Event::Mouse(mut mouse)) => {
+                    // A burst of wheel ticks scrolls once, by all of them,
+                    // rather than sending Chrome a scroll for each row.
+                    while let Some((_, Msg::Term(Event::Mouse(next)))) = messages.peek() {
+                        let Some(sum) = mouse.add_wheel(next) else { break };
+                        mouse = sum;
+                        messages.next();
+                    }
                     // A burst of moves collapses to the last one.
                     let next_is_move = matches!(
                         messages.peek(),
@@ -1470,9 +1485,28 @@ impl App {
                 }
             }
             MouseKind::Wheel(dx, dy) => {
-                self.chrome.wheel(x, y, dx as f64 * WHEEL_STEP, dy as f64 * WHEEL_STEP, modifiers)
+                let (step_x, step_y) = wheel_step(self.viewport, self.shown);
+                // A burst that cancels out (up and down) is no scroll at all.
+                if (dx, dy) != (0, 0) {
+                    self.chrome.wheel(x, y, dx as f64 * step_x, dy as f64 * step_y, modifiers);
+                }
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wheel_tick_scrolls_the_page_one_row_of_the_pane() {
+        // A Retina pane of 100x40 cells of 16x34 pixels, at 2 pixels per
+        // CSS pixel: a row is 17 CSS pixels tall and a column 8 wide.
+        assert_eq!(wheel_step((800, 680), (100, 40)), (8.0, 17.0));
+        // Zoomed to 200%, the same pane holds half as much page, so a row
+        // moves the page half as far and keeps up with the fingers.
+        assert_eq!(wheel_step((400, 340), (100, 40)), (4.0, 8.5));
     }
 }

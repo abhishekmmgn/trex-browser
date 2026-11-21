@@ -6,6 +6,11 @@ Notable changes to kb. The format follows
 
 ## Unreleased
 
+- Scrolling follows the trackpad: each wheel tick the terminal sends moves
+  the page one row of the pane, rather than 60 CSS pixels, which made a
+  trackpad several times too fast. A mouse wheel moves as many rows a notch
+  as the terminal's own scrollback, and a burst of ticks reaches the page
+  as one scroll.
 - `kb --headless URL` runs kb in the background without a pane, driven by
   `kb ctl` alone, with the same profile and commands. It prints its number,
   `kb ctl -i N quit` stops it (and quits any kb), and it stops by itself
