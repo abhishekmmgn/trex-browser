@@ -216,6 +216,9 @@ struct App {
     loading: bool,
     /// The newest frame, kept to redraw at a new size.
     frame: Option<String>,
+    /// Decoded once per distinct JPEG and retained for redraws.
+    jpeg_pixels: Option<graphics::Pixels>,
+    jpeg_cast: bool,
     /// Whether the terminal reads frames from temporary files.
     by_file: bool,
     /// The page's image on the screen.
@@ -361,6 +364,8 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
         url: String::new(),
         loading: false,
         frame: None,
+        jpeg_pixels: None,
+        jpeg_cast: false,
         by_file: false,
         page: Default::default(),
         png_only: false,
@@ -529,6 +534,20 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                     }
                     if id == graphics::FILE_QUERY_ID {
                         app.by_file = ok;
+                        if ok && !app.jpeg_cast {
+                            let quality = match std::env::var("KB_FRAME_FORMAT").as_deref() {
+                                Ok("jpeg") => Some(90),
+                                Ok("jpeg95") => Some(95),
+                                _ => None,
+                            };
+                            if let Some(quality) = quality {
+                                app.chrome.stop_screencast();
+                                app.chrome.start_screencast_jpeg(quality);
+                                app.jpeg_cast = true;
+                            }
+                        } else if !ok && app.jpeg_cast {
+                            app.resume_png();
+                        }
                         // If it said no, it didn't delete the file either.
                         let _ = std::fs::remove_file(graphics::temp_path(0));
                     }
@@ -596,21 +615,31 @@ fn browse(options: Options, profile: &std::path::Path, window: Window, claim: co
                     }
                     app.devtools.observe(&message, &mut app.chrome);
                     match app.chrome.handle(message) {
-                        Some(PageEvent::Frame(png)) => {
-                            let fits = app.fits(&png);
-                            log(format_args!(
-                                "frame {:?}, {} bytes, fits: {fits}",
-                                graphics::png_size(&png),
-                                png.len()
-                            ));
-                            // A frame rendered for another size (the pane's
-                            // first guess, or the size before a resize) would be
-                            // stretched to fill the pane: wait for the right one.
-                            // Some pages repaint without changing: the same
-                            // frame again is nothing to draw.
-                            if fits && app.frame.as_deref() != Some(png.as_str()) {
-                                app.frame = Some(png);
-                                // The blank page that comes first stays under the logo.
+                        Some(PageEvent::Frame(data)) => {
+                            if app.frame.as_deref() == Some(&data) {
+                                continue;
+                            }
+                            let pixels = if data.starts_with("/9j/") {
+                                if !app.jpeg_cast {
+                                    continue;
+                                }
+                                let Some(pixels) =
+                                    crate::base64::decode(&data).and_then(|bytes| graphics::decode_jpeg(&bytes))
+                                else {
+                                    app.resume_png();
+                                    continue;
+                                };
+                                Some(pixels)
+                            } else {
+                                None
+                            };
+                            let size =
+                                pixels.as_ref().map(|p| (p.width, p.height)).or_else(|| graphics::png_size(&data));
+                            let fits = size.is_some_and(|size| app.fits(size));
+                            log(format_args!("frame {size:?}, {} bytes, fits: {fits}", data.len()));
+                            if fits {
+                                app.jpeg_pixels = pixels;
+                                app.frame = Some(data);
                                 new_frame = app.splash.is_none() || app.committed;
                             }
                         }
@@ -773,7 +802,13 @@ impl App {
             self.window, self.reported_cell, self.shown
         ));
         self.viewport = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
-        if self.frame.as_deref().is_some_and(|png| !self.fits(png)) {
+        let size = self
+            .jpeg_pixels
+            .as_ref()
+            .map(|p| (p.width, p.height))
+            .or_else(|| self.frame.as_deref().and_then(graphics::png_size));
+        if size.is_some_and(|size| !self.fits(size)) {
+            self.jpeg_pixels = None;
             self.frame = None;
         }
         self.chrome.resize(self.viewport.0, self.viewport.1, self.scale);
@@ -1029,8 +1064,7 @@ impl App {
 
     /// Whether a frame was rendered at the size the page is laid out at now,
     /// give or take rounding.
-    fn fits(&self, png: &str) -> bool {
-        let Some((width, height)) = graphics::png_size(png) else { return false };
+    fn fits(&self, (width, height): (u32, u32)) -> bool {
         let close = |actual: u32, css: u32| {
             // Chrome renders at its launch scale whatever the zoom: zoomed
             // in, the frame has fewer pixels than the cells and is stretched
@@ -1039,6 +1073,14 @@ impl App {
             (actual as f64 - expected).abs() <= (expected / 100.0).max(2.0)
         };
         close(width, self.viewport.0) && close(height, self.viewport.1)
+    }
+
+    fn resume_png(&mut self) {
+        self.jpeg_cast = false;
+        self.jpeg_pixels = None;
+        self.frame = None;
+        self.chrome.stop_screencast();
+        self.chrome.start_screencast();
     }
 
     fn navigate(&mut self, url: &str) {
@@ -1056,7 +1098,13 @@ impl App {
         if frame && self.splash.take().is_some() {
             crate::splash::Splash::remove(&mut out, 2);
         }
-        if let Some(png) = self.frame.as_deref().filter(|_| frame) {
+        if let Some(pixels) = self.jpeg_pixels.as_ref().filter(|_| frame) {
+            if self.page.draw_pixels(&mut out, pixels, self.shown) {
+                log(format_args!("drew JPEG by file"));
+            } else {
+                self.resume_png();
+            }
+        } else if let Some(png) = self.frame.as_deref().filter(|_| frame) {
             let (cols, rows) = self.shown;
             let scaled = self.fixed.is_some();
             let route = match (self.by_file, self.png_only) {

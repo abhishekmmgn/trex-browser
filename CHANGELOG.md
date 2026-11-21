@@ -6,6 +6,8 @@ Notable changes to kb. The format follows
 
 ## Unreleased
 
+- Local panes can opt into JPEG frames with `KB_FRAME_FORMAT=jpeg` or `jpeg95`.
+
 ## 0.2.0 — 2026-11-21
 
 - The first release with prebuilt kbs for macOS and Linux, on ARM and

@@ -59,6 +59,7 @@ const MODES: &[Mode] = &[
     Mode { name: "png, pixels by file", source: Source::Png, transfer: Transfer::File },
     Mode { name: "png, changed tiles by file", source: Source::Png, transfer: Transfer::Tiles },
     Mode { name: "jpeg 100, pixels by file", source: Source::Jpeg(100), transfer: Transfer::File },
+    Mode { name: "jpeg 95, pixels by file", source: Source::Jpeg(95), transfer: Transfer::File },
     Mode { name: "jpeg 90, pixels by file", source: Source::Jpeg(90), transfer: Transfer::File },
 ];
 
@@ -324,9 +325,10 @@ fn run_modes(
                 }
                 Transfer::File => {
                     let bytes = crate::base64::decode(&data).ok_or("Chrome sent a damaged frame")?;
-                    let pixels = match mode.source {
-                        Source::Png => graphics::decode_png(&bytes, Vec::new()),
-                        Source::Jpeg(_) => graphics::decode_jpeg(&bytes),
+                    let pixels = if bytes.starts_with(&[0xff, 0xd8]) {
+                        graphics::decode_jpeg(&bytes)
+                    } else {
+                        graphics::decode_png(&bytes, Vec::new())
                     }
                     .ok_or("couldn't decode a frame")?;
                     let path = graphics::next_path();
