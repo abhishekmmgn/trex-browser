@@ -23,8 +23,8 @@ enum Axis {
     Down,
 }
 
-/// Keeps a swipe to one axis: up and down, unless the latest ticks go
-/// across at least twice as often.
+/// Keeps a swipe to one axis: the first tick's, until the latest ticks go
+/// the other way at least twice as often.
 #[derive(Default)]
 pub struct AxisLock {
     recent: VecDeque<Axis>,
@@ -37,9 +37,12 @@ impl AxisLock {
     /// swipe's direction dropped.
     pub fn filter(&mut self, now: Instant, right: i32, down: i32) -> (i32, i32) {
         if self.last.is_none_or(|last| now.saturating_duration_since(last) > SWIPE_GAP) {
-            // A new swipe starts out up and down, the way pages scroll.
+            // A new swipe goes the way its first tick does. Swipes up and
+            // down (Rex's, at least) start with a tick up or down, and one
+            // across then needn't let drift up or down through before the
+            // ticks across outnumber it.
             self.recent.clear();
-            self.across = false;
+            self.across = right != 0 && down == 0;
         }
         self.last = Some(now);
         let ticks = std::iter::repeat_n(Axis::Across, right.unsigned_abs() as usize)
@@ -112,14 +115,16 @@ mod tests {
 
     #[test]
     fn a_swipe_across_scrolls_across() {
-        // The first tick is held to up and down, the way pages scroll.
-        assert_eq!(locked(">>>>>>>>"), ".>>>>>>>");
-        assert_eq!(locked("<<<<"), ".<<<");
+        assert_eq!(locked(">>>>>>>>"), ">>>>>>>>");
+        assert_eq!(locked("<<<<"), "<<<<");
+        // Fingers swiping across drift up and down too: none of it moves
+        // the page up or down, even right at the start.
+        assert_eq!(locked(">v>>v>>>^>>v>>"), ">.>>.>>>.>>.>>");
         // A swipe that turns from up to across follows, once the ticks
         // across clearly outnumber the rest.
         assert_eq!(locked("^^^^<^^<>>>>>>>>>>>>>>>"), "^^^^.^^......>>>>>>>>>>");
         // And back.
-        assert_eq!(locked(">>>>>>vvvvvvvvvvvv"), ".>>>>>.......vvvvv");
+        assert_eq!(locked(">>>>>>vvvvvvvvvvvv"), ">>>>>>.......vvvvv");
     }
 
     #[test]
@@ -128,9 +133,10 @@ mod tests {
         let start = Instant::now();
         assert_eq!(lock.filter(start, 2, 0), (2, 0));
         assert_eq!(lock.filter(start + FRAME, 1, 0), (1, 0));
-        // A pause, and a tick across alone is a stray again.
+        // After a pause, a swipe up and down starts with up and down.
         let later = start + SWIPE_GAP * 2;
-        assert_eq!(lock.filter(later, 1, 0), (0, 0));
-        assert_eq!(lock.filter(later + FRAME, 0, 1), (0, 1));
+        assert_eq!(lock.filter(later, 0, 1), (0, 1));
+        assert_eq!(lock.filter(later + FRAME, 1, 0), (0, 0));
+        assert_eq!(lock.filter(later + FRAME * 2, 0, 1), (0, 1));
     }
 }
