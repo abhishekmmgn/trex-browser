@@ -44,6 +44,13 @@ Notable changes to kb. The format follows
   trackpad several times too fast. A mouse wheel moves as many rows a notch
   as the terminal's own scrollback, and a burst of ticks reaches the page
   as one scroll.
+- In Rex, `kb ctl` and `kb mcp serve` without `-i` or `KB_INSTANCE` go to
+  the kb in the caller's Rex window, else in its session, rather than the
+  lowest-numbered kb, which was often the user's own somewhere else. With
+  several there, they fail and list them (id, page, pane) rather than
+  guess. Outside Rex, and with no kb there, nothing changes. kb asks `rex`
+  which window each pane is in; if it can't, it still finds the kbs in the
+  session.
 - `kb --headless URL` runs kb in the background without a pane, driven by
   `kb ctl` alone, with the same profile and commands. It prints its id,
   `kb ctl -i ID quit` stops it (and quits any kb), and it stops by itself

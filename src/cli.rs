@@ -11,7 +11,9 @@ fn usage() -> String {
          Controls the kb browser running in a terminal pane: what you do here\n\
          happens on the page the user is looking at. With several kbs running,\n\
          kb ctl -i ID <command> picks one, by the number, id or name kb list\n\
-         shows; the default is the lowest-numbered.\n\n",
+         shows. The default, in Rex, is the kb in your window, else in your\n\
+         session (if there are several there, it fails and lists them);\n\
+         elsewhere, or with none there, the lowest-numbered.\n\n",
     );
     for command in COMMANDS {
         text.push_str(&format!("  {}\n      {}\n", command.synopsis(), command.help));
@@ -142,25 +144,15 @@ pub fn run(mut words: &[String]) -> i32 {
 /// `kb list`: the kbs running now, one per line, by number or name.
 /// Returns the exit status.
 pub fn list() -> i32 {
-    let running = control::running();
-    if running.is_empty() {
+    let kbs = control::listing();
+    if kbs.is_empty() {
         eprintln!("kb: {}", control::NOT_RUNNING);
         return 1;
     }
-    for instance in running {
-        std::env::set_var("KB_INSTANCE", &instance);
-        let (page, pane, id) = match control::request("status", json!({"listing": true})) {
-            Ok(Output::Text(status)) => {
-                let field =
-                    |name: &str| status.lines().find_map(|line| line.strip_prefix(name)).unwrap_or("").to_owned();
-                let url = field("url: ");
-                (if url.is_empty() { "about:blank".to_owned() } else { url }, field("pane: "), field("id: "))
-            }
-            _ => ("(not answering)".to_owned(), String::new(), String::new()),
-        };
+    for kb in kbs {
         // The pane tells kbs apart: an agent knows the one it split. The id
         // names this run of it, so a number taken over later isn't mistaken.
-        println!("{instance}\t{page}\t{pane}\t{id}");
+        println!("{}\t{}\t{}\t{}", kb.which, kb.url, kb.pane, kb.id);
     }
     0
 }
